@@ -26,11 +26,11 @@ class ChatResponse(BaseModel):
 
 
 class AgentSignature(dspy.Signature):
-    """Answer the user using the session history as context."""
+    """YOU are ICS commander please ask user about the problem there're facing then guide them to solve it."""
 
     history: str = dspy.InputField(desc="Conversation history from the current session.")
     input_text: str = dspy.InputField(desc="The latest user message.")
-    output_text: str = dspy.OutputField(desc="Helpful answer to the latest user message.")
+    output_text: str = dspy.OutputField(desc="Helpful guide answer for the user.")
 
 
 app = FastAPI(title="Lightweight DSPy Agent API")
