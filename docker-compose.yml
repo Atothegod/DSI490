@@ -7,7 +7,7 @@ services:
       - ./dspy-agent/.env
     environment:
       GEMINI_MODEL: gemini/gemini-2.5-flash
-      DATABASE_URL: postgresql://agent:agentpass@db:5432/agentdb
+      DATABASE_URL: postgresql://agent:agentpass@db:5433/agentdb
     ports:
       - "8010:8000"
     depends_on:
@@ -20,7 +20,7 @@ services:
       POSTGRES_PASSWORD: agentpass
       POSTGRES_DB: agentdb
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
