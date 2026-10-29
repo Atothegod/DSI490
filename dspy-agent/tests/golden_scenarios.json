@@ -1,0 +1,676 @@
+{
+  "version": "1.1",
+  "description": "Golden Test Scenarios สำหรับ Agent 1 อ้างอิง Design Decisions v1.0. expect เป็นการตรวจแบบบางส่วน (ตรวจเฉพาะค่าที่ระบุ). incident อ้างด้วย label เช่น A, B แทน id จริง. at = นาทีนับจากเริ่ม scenario",
+  "conventions": {
+    "kind": {
+      "conversation": "ต้องใช้ LLM ทดสอบใน Notebook ขั้นที่ 4-6",
+      "rule": "ทดสอบด้วย Backend Rules ล้วน ไม่ใช้ LLM ขั้นที่ 3"
+    },
+    "forbidden_claims": [
+      "เจ้าหน้าที่กำลังไป",
+      "กำลังส่งเจ้าหน้าที่",
+      "ได้รับความช่วยเหลือแล้ว",
+      "ทีมกู้ภัยกำลังเดินทาง"
+    ]
+  },
+  "scenarios": [
+    {
+      "id": "G01",
+      "title": "แจ้งครั้งแรกแบบสั้น ถามตำแหน่งก่อน",
+      "kind": "conversation",
+      "covers": ["2.1", "2.2"],
+      "turns": [
+        {
+          "at": 0,
+          "user": "น้ำท่วมบ้านครับ",
+          "expect": {
+            "intents_include": ["report_flood"],
+            "incident": "A",
+            "incident_status": "draft",
+            "fields": {
+              "situation": {"status": "known", "tags_include": ["water_in_house"]},
+              "location_area": {"status": "not_asked"}
+            },
+            "next_actions_include": ["ask_follow_up"],
+            "pending_fields_include": ["location_area"],
+            "events": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "G02",
+      "title": "ให้หลาย field ในข้อความเดียว ไม่ถามซ้ำ",
+      "kind": "conversation",
+      "covers": ["2.1", "2.3", "2.4"],
+      "turns": [
+        {
+          "at": 0,
+          "user": "น้ำเข้าบ้านที่ตำบลทับยา อินทร์บุรี น้ำถึงเอว มีคนแก่สองคน แค่อยากแจ้งไว้ก่อนครับ",
+          "expect": {
+            "incident": "A",
+            "fields": {
+              "location_area": {"status": "known", "value_contains": "ทับยา"},
+              "situation": {"status": "known", "tags_include": ["water_in_house"]},
+              "water_level": {"status": "known", "descriptor": "waist", "cm": null},
+              "needs": {"status": "known", "value": ["info_only"]},
+              "vulnerable_people": {"status": "known", "groups_include": [{"type": "elderly", "count": 2}]}
+            },
+            "must_not_ask": ["location_area", "water_level", "vulnerable_people", "needs"],
+            "next_actions_include": ["ask_follow_up"],
+            "pending_fields_include": ["affected_people"]
+          }
+        }
+      ]
+    },
+    {
+      "id": "G03",
+      "title": "คำตอบสั้นผูกกับ Pending Question",
+      "kind": "conversation",
+      "covers": ["3.3"],
+      "turns": [
+        {
+          "at": 0,
+          "user": "น้ำท่วมบ้านที่ตำบลโพธิ์ชัย อินทร์บุรีครับ",
+          "expect": {"incident": "A"}
+        },
+        {
+          "at": 1,
+          "agent_asked": ["water_level"],
+          "user": "80 เซนติเมตร",
+          "expect": {
+            "incident": "A",
+            "fields": {"water_level": {"status": "known", "cm": 80}},
+            "must_not_ask": ["water_level", "location_area"]
+          }
+        }
+      ]
+    },
+    {
+      "id": "G04",
+      "title": "แก้ไขข้อมูลหลังส่งแล้ว เก็บประวัติและส่ง update",
+      "kind": "conversation",
+      "covers": ["2.5", "Handoff 8.7"],
+      "setup": {
+        "incidents": [
+          {
+            "label": "A",
+            "status": "submitted",
+            "location_area": "ตำบลทับยา อำเภออินทร์บุรี",
+            "water_level": {"raw": "50 เซนติเมตร", "cm": 50},
+            "needs": ["info_only"]
+          }
+        ],
+        "active_incident": "A"
+      },
+      "turns": [
+        {
+          "at": 0,
+          "user": "แก้เป็น 80 เซนติเมตรครับ พิมพ์ผิด",
+          "expect": {
+            "intents_include": ["correct_information"],
+            "incident": "A",
+            "fields": {
+              "water_level": {"status": "known", "cm": 80, "history_last": {"cm": 50, "change_type": "correction"}}
+            },
+            "next_actions_include": ["send_update"],
+            "events": [{"type": "incident_updated", "changes_include": [{"field": "water_level", "change_type": "correction"}]}]
+          }
+        }
+      ]
+    },
+    {
+      "id": "G05",
+      "title": "ตอบไม่ทราบ บันทึก unknown และไม่ถามวน",
+      "kind": "conversation",
+      "covers": ["2.2"],
+      "setup": {
+        "incidents": [
+          {"label": "A", "status": "draft", "location_area": "ตำบลบางระจัน", "situation": "น้ำท่วมถนนหน้าบ้าน", "needs": ["info_only"]}
+        ],
+        "active_incident": "A",
+        "pending_fields": ["affected_people"]
+      },
+      "turns": [
+        {
+          "at": 0,
+          "user": "ไม่แน่ใจครับ ไม่รู้ว่าบ้านอื่นเป็นยังไง",
+          "expect": {
+            "fields": {"affected_people": {"status": "unknown"}},
+            "must_not_ask": ["affected_people"]
+          }
+        },
+        {
+          "at": 1,
+          "user": "แค่นี้ครับ",
+          "expect": {
+            "must_not_ask": ["affected_people"],
+            "next_actions_include": ["confirm_report"]
+          }
+        }
+      ]
+    },
+    {
+      "id": "G06",
+      "title": "มีคนติดค้าง ส่งทันทีแม้ข้อมูลไม่ครบ พร้อมสายด่วน",
+      "kind": "conversation",
+      "covers": ["1.1", "1.2", "1.4", "2.4"],
+      "turns": [
+        {
+          "at": 0,
+          "user": "ช่วยด้วยครับ ยายติดอยู่บนหลังคา น้ำขึ้นเร็วมาก อยู่หมู่ 3 ตำบลน้ำตาล",
+          "expect": {
+            "intents_include": ["request_help"],
+            "incident": "A",
+            "incident_status": "submitted",
+            "urgent_flags_include": ["people_trapped", "help_requested"],
+            "fields": {
+              "needs": {"if_known_value_include": ["rescue"]},
+              "situation": {"status": "known", "text_contains": "หลังคา"}
+            },
+            "next_actions_include": ["submit_report", "ask_follow_up"],
+            "events": [{"type": "incident_submitted", "trigger": "urgent_flags"}],
+            "used_hotline_template": true,
+            "output_must_contain": ["1784", "1669"],
+            "output_must_not_contain_forbidden_claims": true,
+            "pending_fields_include_any": ["location_coordinates", "location_landmark", "affected_people", "contact"]
+          }
+        }
+      ]
+    },
+    {
+      "id": "G07",
+      "title": "ถามคำถามแทรกระหว่างเก็บข้อมูล แล้วกลับมาถามต่อ",
+      "kind": "conversation",
+      "covers": ["4.1", "3.3"],
+      "setup": {
+        "incidents": [
+          {"label": "A", "status": "draft", "location_area": "ตำบลถอนสมอ", "situation": "น้ำเข้าบ้าน"}
+        ],
+        "active_incident": "A",
+        "pending_fields": ["needs"]
+      },
+      "turns": [
+        {
+          "at": 0,
+          "user": "เดี๋ยวก่อนครับ ต้องตัดไฟตอนไหน",
+          "expect": {
+            "intents_include": ["ask_information"],
+            "next_actions_include": ["answer_question"],
+            "sources_min": 1,
+            "pending_fields_include": ["needs"],
+            "fields": {"needs": {"status": "not_asked"}}
+          }
+        }
+      ]
+    },
+    {
+      "id": "G08",
+      "title": "กลับมาวันถัดไป อัปเดตเหตุเดิมอัตโนมัติ",
+      "kind": "conversation",
+      "covers": ["3.2", "3.3", "2.5"],
+      "setup": {
+        "incidents": [
+          {
+            "label": "A",
+            "status": "submitted",
+            "location_area": "ตำบลทับยา อำเภออินทร์บุรี",
+            "water_level": {"raw": "80 เซนติเมตร", "cm": 80},
+            "vulnerable_people": [{"type": "elderly", "count": 2}],
+            "needs": ["info_only"]
+          }
+        ],
+        "active_incident": "A",
+        "last_message_minutes_ago": 1440
+      },
+      "turns": [
+        {
+          "at": 0,
+          "user": "ตอนนี้น้ำขึ้นเป็นเมตรแล้วครับ",
+          "expect": {
+            "intents_include": ["update_incident"],
+            "incident": "A",
+            "fields": {"water_level": {"cm": 100, "history_last": {"cm": 80, "change_type": "update"}}},
+            "events": [{"type": "incident_updated", "changes_include": [{"field": "water_level", "change_type": "update"}]}],
+            "output_must_contain_any": ["ผู้สูงอายุ", "คุณยาย", "คุณตา", "ผู้สูงวัย"],
+            "must_not_ask": ["location_area"]
+          }
+        }
+      ]
+    },
+    {
+      "id": "G09",
+      "title": "แจ้งตำแหน่งใหม่ระหว่างมีเหตุเปิด ต้องถาม ไม่รวมอัตโนมัติ",
+      "kind": "conversation",
+      "covers": ["3.2"],
+      "setup": {
+        "incidents": [
+          {"label": "A", "status": "submitted", "location_area": "ตำบลทับยา อำเภออินทร์บุรี", "needs": ["info_only"]}
+        ],
+        "active_incident": "A"
+      },
+      "turns": [
+        {
+          "at": 0,
+          "user": "บ้านแม่ที่พรหมบุรีน้ำเข้าแล้วครับ",
+          "expect": {
+            "next_actions_include": ["ask_incident_match"],
+            "incident_A_unchanged_fields": ["location_area", "situation"],
+            "events": []
+          }
+        },
+        {
+          "at": 1,
+          "user": "คนละที่ครับ เป็นบ้านแม่",
+          "expect": {
+            "incident": "B",
+            "incident_status": "draft",
+            "matching_status": "new",
+            "fields": {"location_area": {"status": "known", "value_contains": "พรหมบุรี"}}
+          }
+        }
+      ]
+    },
+    {
+      "id": "G10",
+      "title": "เร่งด่วนแต่ไม่ชัดว่าเหตุไหน สร้าง Provisional Incident",
+      "kind": "conversation",
+      "covers": ["3.2", "1.1"],
+      "setup": {
+        "incidents": [
+          {"label": "A", "status": "submitted", "location_area": "ตำบลทับยา อำเภออินทร์บุรี", "needs": ["info_only"]}
+        ],
+        "active_incident": "A"
+      },
+      "turns": [
+        {
+          "at": 0,
+          "user": "มีคนบาดเจ็บ ขาโดนของมีคมตอนลุยน้ำ ช่วยด้วย",
+          "expect": {
+            "urgent_flags_include": ["injury_reported", "help_requested"],
+            "incident": "B",
+            "incident_status": "submitted",
+            "matching_status": "unconfirmed",
+            "possible_related_include": ["A"],
+            "events": [{"type": "incident_submitted", "trigger": "urgent_flags"}],
+            "used_hotline_template": true,
+            "next_actions_include": ["submit_report", "ask_incident_match"]
+          }
+        },
+        {
+          "at": 2,
+          "user": "ที่บ้านเดิมครับ ทับยา",
+          "expect": {
+            "incident": "B",
+            "matching_status": "linked",
+            "events": [{"type": "incident_linked", "linked_to": "A", "relation": "same_incident"}]
+          }
+        }
+      ]
+    },
+    {
+      "id": "G11",
+      "title": "ถามระดับน้ำในพื้นที่ (กลุ่ม C) ห้ามตอบตัวเลข",
+      "kind": "conversation",
+      "covers": ["4.1"],
+      "turns": [
+        {
+          "at": 0,
+          "user": "ตอนนี้น้ำที่อินทร์บุรีสูงเท่าไหร่แล้วครับ",
+          "expect": {
+            "intents_include": ["ask_information"],
+            "next_actions_include": ["answer_question"],
+            "output_must_not_match_regex": "\\d+\\s*(ซม|เซน|cm|เมตร|ม\\.)",
+            "incident": null,
+            "events": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "G12",
+      "title": "ผู้ใช้แจ้งว่าน้ำลดแล้ว ปิดและส่ง Close Event",
+      "kind": "conversation",
+      "covers": ["3.1"],
+      "setup": {
+        "incidents": [
+          {"label": "A", "status": "submitted", "location_area": "ตำบลทับยา", "needs": ["info_only"]}
+        ],
+        "active_incident": "A"
+      },
+      "turns": [
+        {
+          "at": 0,
+          "user": "น้ำลดหมดแล้วครับ ขอบคุณ",
+          "expect": {
+            "intents_include": ["resolve_incident"],
+            "incident": "A",
+            "incident_status": "closed",
+            "close_reason": "user_resolved",
+            "events": [{"type": "incident_closed", "close_reason": "user_resolved"}]
+          }
+        }
+      ]
+    },
+    {
+      "id": "G13",
+      "title": "กลับมาหลังปิดแล้ว เหตุเดิมเกิดซ้ำ สร้างใหม่พร้อม related",
+      "kind": "conversation",
+      "covers": ["3.1"],
+      "setup": {
+        "incidents": [
+          {"label": "A", "status": "closed", "close_reason": "user_resolved", "location_area": "ตำบลทับยา อำเภออินทร์บุรี", "needs": ["info_only"]}
+        ],
+        "active_incident": null,
+        "last_message_minutes_ago": 10080
+      },
+      "turns": [
+        {
+          "at": 0,
+          "user": "น้ำกลับมาท่วมบ้านอีกแล้วครับ",
+          "expect": {
+            "incident": "B",
+            "incident_status": "draft",
+            "related_incident": "A",
+            "incident_A_status": "closed",
+            "next_actions_include": ["ask_follow_up"],
+            "output_must_contain_any": ["ทับยา"]
+          }
+        }
+      ]
+    },
+    {
+      "id": "G14",
+      "title": "เบอร์โทรในข้อความ ต้องย้ายไป contact และปิดบัง",
+      "kind": "conversation",
+      "covers": ["2.6"],
+      "turns": [
+        {
+          "at": 0,
+          "user": "บ้านยายติดน้ำ ออกไม่ได้ อยากให้ช่วยอพยพ ตำบลน้ำตาล เบอร์ 081-234-5678",
+          "expect": {
+            "urgent_flags_include": ["help_requested"],
+            "fields": {"situation": {"status": "known", "text_not_contains": "081-234-5678"}},
+            "contact_record_created": true,
+            "report_contact_available": true,
+            "report_must_not_contain": ["081-234-5678", "0812345678"]
+          }
+        }
+      ]
+    },
+    {
+      "id": "G15",
+      "title": "ถามสถานะ ตอบได้เฉพาะสถานะการส่ง",
+      "kind": "conversation",
+      "covers": ["1.3", "1.4"],
+      "setup": {
+        "incidents": [
+          {"label": "A", "status": "submitted", "location_area": "ตำบลทับยา", "needs": ["evacuation"], "delivery_status": "acked"}
+        ],
+        "active_incident": "A"
+      },
+      "turns": [
+        {
+          "at": 0,
+          "user": "เรื่องที่แจ้งไปถึงไหนแล้วครับ",
+          "expect": {
+            "intents_include": ["check_status"],
+            "delivery_status": "acked",
+            "output_must_not_contain_forbidden_claims": true,
+            "events": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "G16",
+      "title": "ขอลบข้อมูล ลบฝั่ง Agent 1 และส่ง Deletion Event",
+      "kind": "conversation",
+      "covers": ["3.5"],
+      "setup": {
+        "incidents": [
+          {"label": "A", "status": "submitted", "location_area": "ตำบลทับยา", "needs": ["rescue"], "has_contact": true}
+        ]
+      },
+      "turns": [
+        {
+          "at": 0,
+          "user": "ลบข้อมูลของฉัน",
+          "expect": {
+            "intents_include": ["delete_my_data"],
+            "next_actions_include": ["delete_user_data"],
+            "events": [{"type": "data_deletion_requested"}]
+          }
+        }
+      ]
+    },
+    {
+      "id": "G17",
+      "title": "มีผู้สูงอายุ ไม่ได้แปลว่าติดค้าง",
+      "kind": "conversation",
+      "covers": ["1.2"],
+      "turns": [
+        {
+          "at": 0,
+          "user": "มีผู้สูงอายุสองคนในบ้าน",
+          "expect": {
+            "urgent_flags": [],
+            "fields": {"vulnerable_people": {"status": "known", "groups_include": [{"type": "elderly", "count": 2}]}}
+          }
+        }
+      ]
+    },
+    {
+      "id": "G18",
+      "title": "สถานที่เป็น landmark ตำบลเป็น area",
+      "kind": "conversation",
+      "covers": ["2.1", "2.3"],
+      "turns": [
+        {
+          "at": 0,
+          "user": "น้ำท่วมหน้าวัดโพธิ์ชัย ตำบลถอนสมอ",
+          "expect": {
+            "fields": {
+              "location_area": {"status": "known", "value_contains": "ถอนสมอ"},
+              "location_landmark": {"status": "known", "value_contains": "วัดโพธิ์ชัย"},
+              "situation": {"status": "known", "tags_include": ["area_flooded"]}
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "R01",
+      "title": "Draft ไม่เคลื่อนไหว 7 วัน เป็น abandoned",
+      "kind": "rule",
+      "covers": ["3.1"],
+      "setup": {
+        "incidents": [{"label": "A", "status": "draft", "location_area": "ตำบลทับยา", "last_activity_minutes_ago": 10081}]
+      },
+      "expect": {"incident_A_status": "abandoned", "events": []}
+    },
+    {
+      "id": "R02",
+      "title": "Draft ที่มี urgent_flags ห้ามเป็น abandoned",
+      "kind": "rule",
+      "covers": ["3.1"],
+      "setup": {
+        "incidents": [{"label": "A", "status": "draft", "urgent_flags": ["people_trapped"]}]
+      },
+      "expect": {"incident_A_status": "submitted", "events": [{"type": "incident_submitted", "trigger": "urgent_flags"}]}
+    },
+    {
+      "id": "R03",
+      "title": "Submitted ไม่มีการอัปเดต 14 วัน ปิดด้วย timeout",
+      "kind": "rule",
+      "covers": ["3.1"],
+      "setup": {
+        "incidents": [{"label": "A", "status": "submitted", "location_area": "ตำบลทับยา", "needs": ["info_only"], "last_activity_minutes_ago": 20161}]
+      },
+      "expect": {"incident_A_status": "closed", "close_reason": "timeout", "events": [{"type": "incident_closed", "close_reason": "timeout"}]}
+    },
+    {
+      "id": "R04",
+      "title": "ข้อความถามความรู้ไม่ต่ออายุ incident",
+      "kind": "rule",
+      "covers": ["3.1"],
+      "setup": {
+        "incidents": [{"label": "A", "status": "submitted", "location_area": "ตำบลทับยา", "needs": ["info_only"], "last_activity_minutes_ago": 100}]
+      },
+      "input": {"intents": ["ask_information"], "updates": []},
+      "expect": {"incident_A_last_activity_unchanged": true}
+    },
+    {
+      "id": "R05",
+      "title": "LINE event ซ้ำ ไม่สร้างรายงานหรือ event ซ้ำ",
+      "kind": "rule",
+      "covers": ["1.3"],
+      "input": {"line_event_ids": ["ev-1", "ev-1"]},
+      "expect": {"processed_messages": 1, "max_submitted_events": 1}
+    },
+    {
+      "id": "R06",
+      "title": "ผู้ใช้สองคน Memory ไม่ปน",
+      "kind": "rule",
+      "covers": ["Handoff 8.6"],
+      "input": {"users": ["U_line_a", "U_line_b"]},
+      "expect": {"user_b_sees_incidents_of_user_a": false}
+    },
+    {
+      "id": "R07",
+      "title": "รายงานที่ส่ง Agent 2 ไม่มี LINE User ID และพิกัดส่งเฉพาะกรณี rescue/evacuation",
+      "kind": "rule",
+      "covers": ["2.6"],
+      "setup": {
+        "incidents": [
+          {"label": "A", "status": "draft", "location_area": "ตำบลทับยา", "needs": ["food_water"], "coordinates": [14.9, 100.33]},
+          {"label": "B", "status": "draft", "location_area": "ตำบลน้ำตาล", "needs": ["evacuation"], "coordinates": [14.95, 100.36]}
+        ]
+      },
+      "expect": {"report_A_has_coordinates": false, "report_B_has_coordinates": true, "reports_contain_line_user_id": false}
+    },
+    {
+      "id": "R09",
+      "title": "คำตอบของ pending question สำหรับ field ที่ยังไม่มีค่า เป็น initial แม้ Gemini บอกว่าแก้ไข",
+      "kind": "rule",
+      "covers": ["6.7"],
+      "setup": {
+        "incidents": [{"label": "A", "status": "draft", "location_area": "ตำบลทับยา", "needs": ["info_only"]}],
+        "active_incident": "A",
+        "pending_fields": ["water_level"]
+      },
+      "input": {"message": "80 เซนติเมตร", "updates": [{"field": "water_level", "status": "known", "value": {"raw": "80 เซนติเมตร", "cm": 80}, "raw": "80 เซนติเมตร", "is_correction": true}]},
+      "expect": {"fields": {"water_level": {"status": "known", "cm": 80}}, "change_type": "initial", "events": []}
+    },
+    {
+      "id": "R10",
+      "title": "ค่าเดิมซ้ำเป็น confirmation ไม่ส่ง event แต่ต่ออายุ incident",
+      "kind": "rule",
+      "covers": ["6.7", "3.1"],
+      "setup": {
+        "incidents": [{"label": "A", "status": "submitted", "location_area": "ตำบลทับยา", "needs": ["info_only"], "water_level": {"raw": "80 เซนติเมตร", "cm": 80}, "last_activity_minutes_ago": 600}]
+      },
+      "input": {"message": "ยังประมาณ 80 เซนติเมตรค่ะ", "updates": [{"field": "water_level", "status": "known", "value": {"raw": "80 เซนติเมตร", "cm": 80}, "raw": "80 เซนติเมตร"}]},
+      "expect": {"change_type": "confirmation", "events": [], "incident_A_last_activity_updated": true}
+    },
+    {
+      "id": "R11",
+      "title": "คำแก้ผูกกับ field ของตัวเองเท่านั้น",
+      "kind": "rule",
+      "covers": ["6.7"],
+      "setup": {
+        "incidents": [{"label": "A", "status": "submitted", "location_area": "ตำบลทับยา", "needs": ["info_only"], "water_level": {"raw": "50 เซนติเมตร", "cm": 50}}]
+      },
+      "input": {"message": "พิมพ์ตำบลผิด เป็นตำบลน้ำตาล แต่น้ำขึ้นเป็น 80 เซนติเมตร", "updates": [
+        {"field": "location_area", "status": "known", "value": {"name": "ตำบลน้ำตาล", "level": "tambon"}, "raw": "พิมพ์ตำบลผิด เป็นตำบลน้ำตาล", "is_correction": true},
+        {"field": "water_level", "status": "known", "value": {"raw": "80 เซนติเมตร", "cm": 80}, "raw": "น้ำขึ้นเป็น 80 เซนติเมตร", "is_correction": true}]},
+      "expect": {"events": [{"type": "incident_updated", "changes_include": [{"field": "location_area", "change_type": "correction"}, {"field": "water_level", "change_type": "update"}]}]}
+    },
+    {
+      "id": "R12",
+      "title": "แสดงสายด่วนครั้งเดียวต่อชนิด flag แม้พบซ้ำจากอีกแหล่ง",
+      "kind": "rule",
+      "covers": ["6.6"],
+      "setup": {
+        "incidents": [{"label": "A", "status": "submitted", "location_area": "ตำบลน้ำตาล", "urgent_flags": ["people_trapped"], "hotline_notified": ["people_trapped"]}]
+      },
+      "input": {"message": "ยายยังติดอยู่บนหลังคาค่ะ", "urgent_flags_from_keyword": ["people_trapped"]},
+      "expect": {"used_hotline_template": false}
+    },
+    {
+      "id": "R13",
+      "title": "urgent flag อย่างเดียวไม่ส่งพิกัดให้ Agent 2",
+      "kind": "rule",
+      "covers": ["2.6", "6.10"],
+      "setup": {
+        "incidents": [{"label": "A", "status": "submitted", "location_area": "ตำบลน้ำตาล", "needs": ["medical"], "urgent_flags": ["injury_reported"], "coordinates": [14.95, 100.36], "coordinates_unsolicited": true}]
+      },
+      "expect": {"report_A_has_coordinates": false, "next_actions_include": ["ask_follow_up"], "pending_fields_include": ["location_coordinates"]}
+    },
+    {
+      "id": "R14",
+      "title": "ผู้ใช้แชร์พิกัดหลังเห็นข้อความแจ้ง ส่งพิกัดตาม consent",
+      "kind": "rule",
+      "covers": ["6.10"],
+      "setup": {
+        "incidents": [{"label": "A", "status": "submitted", "location_area": "ตำบลน้ำตาล", "urgent_flags": ["people_trapped"], "location_request_pending": true}]
+      },
+      "input": {"line_location": [14.95, 100.36]},
+      "expect": {"report_A_has_coordinates": true, "report_A_coordinates_basis": "consent", "fields": {"needs": {"status": "not_asked"}}}
+    },
+    {
+      "id": "R15",
+      "title": "ขอลบข้อมูลแล้ว ระงับการแนบพิกัดแม้ needs เป็น rescue",
+      "kind": "rule",
+      "covers": ["6.10", "3.5"],
+      "setup": {
+        "incidents": [{"label": "A", "status": "submitted", "location_area": "ตำบลน้ำตาล", "needs": ["rescue"], "coordinates": [14.95, 100.36]}]
+      },
+      "input": {"intents": ["delete_my_data"]},
+      "expect": {"report_A_has_coordinates": false, "events": [{"type": "data_deletion_requested", "scope": ["all_personal_data"]}]}
+    },
+    {
+      "id": "R16",
+      "title": "นอกจังหวัดและไม่ด่วน ไม่สร้าง incident",
+      "kind": "rule",
+      "covers": ["6.5"],
+      "input": {"updates": [{"field": "location_area", "status": "known", "value": {"name": "จังหวัดอ่างทอง", "level": "province"}}, {"field": "situation", "status": "known", "value": {"text": "น้ำเข้าบ้าน", "tags": ["water_in_house"]}}]},
+      "expect": {"incident": null, "events": []}
+    },
+    {
+      "id": "R17",
+      "title": "draft ที่พบภายหลังว่านอกจังหวัด ปิดด้วย out_of_service_area โดยไม่ส่ง event",
+      "kind": "rule",
+      "covers": ["6.5", "3.1"],
+      "setup": {
+        "incidents": [{"label": "A", "status": "draft", "location_area": "พรหมบุรี", "needs": ["info_only"]}]
+      },
+      "input": {"updates": [{"field": "location_area", "status": "known", "value": {"name": "จังหวัดอ่างทอง", "level": "province"}, "is_correction": true}]},
+      "expect": {"incident_A_status": "closed", "close_reason": "out_of_service_area", "events": []}
+    },
+    {
+      "id": "R18",
+      "title": "water_level ถามครั้งเดียว ผู้ใช้ข้ามแล้วเป็น unanswered ไม่ใช่ unknown",
+      "kind": "rule",
+      "covers": ["6.9"],
+      "setup": {
+        "incidents": [{"label": "A", "status": "draft", "location_area": "ตำบลทับยา", "needs": ["info_only"], "water_level_ask_count": 1}],
+        "active_incident": "A",
+        "pending_fields": ["water_level"]
+      },
+      "input": {"message": "ต้องตัดไฟตอนไหนคะ", "intents": ["ask_information"], "updates": []},
+      "expect": {"fields": {"water_level": {"status": "unanswered"}}, "must_not_ask": ["water_level"]}
+    },
+    {
+      "id": "R08",
+      "title": "situation.text เปลี่ยนเล็กน้อยไม่ส่ง update",
+      "kind": "rule",
+      "covers": ["2.5"],
+      "setup": {
+        "incidents": [{"label": "A", "status": "submitted", "location_area": "ตำบลทับยา", "situation": "น้ำเข้าบ้าน", "needs": ["info_only"]}]
+      },
+      "input": {"updates": [{"field": "situation", "status": "known", "value": {"text": "น้ำเข้าบ้าน ชั้นล่างเปียกหมด", "tags": ["water_in_house"]}}]},
+      "expect": {"events": []}
+    }
+  ]
+}
