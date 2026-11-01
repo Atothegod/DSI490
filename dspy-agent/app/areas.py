@@ -1,6 +1,7 @@
-"""Exact area matching from human-verified CSV. No fuzzy auto-correction or GPS guessing."""
+"""Exact area matching from human-verified CSV. Close names are only suggested to the user; no auto-correction or GPS guessing."""
 import csv
 import re
+from difflib import SequenceMatcher
 from pathlib import Path
 from .schemas import AreaRef, AreaCandidate, AreaMatchStatus
 
@@ -61,3 +62,32 @@ class AreaResolver:
             narrowed = [r for r in self.rows if r["tambon"] in distinct and r["amphoe"] in {n for *_, n in amphoes}]
             return narrowed or rows
         return rows
+
+    def suggest(self, raw, *, limit=3, threshold=0.7):
+        """
+        Close tambon names for a not_found mention, offered to the user as a question only (6.4).
+        Never used to match automatically; the caller records a match only after the user confirms.
+        """
+        if not self.rows:
+            return []
+        ratio = lambda a, b: SequenceMatcher(None, a, b).ratio()
+        clean = lambda t: re.sub(r"(?:ค่ะ|คะ|ครับ|นะ|จ้า)+$", "", t)
+        tambon = re.search(r"(?:ตำบล|ต\.)\s*([^\s,]+)", raw)
+        amphoe = re.search(r"(?:อำเภอ|อ\.)\s*([^\s,]+)", raw)
+        amphoes = {r["amphoe"] for r in self.rows}
+        if tambon:
+            tokens = [clean(tambon.group(1))]
+        else:
+            stripped = re.sub(r"(?:ตำบล|ต\.|อำเภอ|อ\.|จังหวัด|จ\.)", " ", raw)
+            tokens = [t for t in map(clean, stripped.split()) if t and t not in amphoes]
+        if not tokens:
+            return []
+        rows = self.rows
+        if amphoe:
+            rows = [r for r in rows if ratio(clean(amphoe.group(1)), r["amphoe"]) >= threshold] or rows
+        scored = sorted(((max(ratio(t, r["tambon"]) for t in tokens), r) for r in rows), key=lambda x: -x[0])
+        if not scored or scored[0][0] < threshold:
+            return []
+        best = scored[0][0]
+        return [AreaCandidate(**{k: r[k] for k in ("tambon_code", "tambon", "amphoe_code", "amphoe")})
+                for score, r in scored[:limit] if score >= best - 0.05]

@@ -31,6 +31,7 @@ from .conversation import (
     apply_submission,
     plan_turn,
     reconcile_needs,
+    render_questions,
     render_reply,
 )
 from .memory import MergeResult, apply_updates, close_unanswered, unverified_area_resolver
@@ -77,6 +78,7 @@ ExtractFn = Callable[[str, IncidentState | None, list[IncidentFieldName] | None]
 POSTBACK_SKIP_LOCATION = "location_share=skip"
 POSTBACK_ALLOW_LOCATION = "location_consent=yes"
 POSTBACK_DENY_LOCATION = "location_consent=no"
+POSTBACK_AREA_SUGGESTION = "area_suggestion="  # + รหัสตำบล หรือ no
 LOCATION_REQUEST_TTL = timedelta(hours=24)  # แชร์หลังจากนี้ ถือว่าไม่ชัดว่าตอบคำขอใด
 
 
@@ -336,6 +338,10 @@ class FloodAgent(RuntimeMixin, dspy.Module):
         text = render_reply(plan, st, hotlines=self.hotlines, templates=self.templates, ack_text=ack_text or ack,
                             question_text=questions, answer_text=answer, delivery_text=delivery_text)
         quick = self._location_buttons() if F.LOCATION_COORDINATES in plan.ask_fields else []
+        suggestion = self._area_suggestion_for(plan, st)
+        if suggestion:
+            text = text.replace(render_questions(st, plan.ask_fields, self.templates), suggestion[0])
+            quick = suggestion[1]
         reply_id = f"{msg_id}_reply"
         # Store the plan, not a successful delivery, until LINE confirms.
         self._delivery_pending = json.loads(json.dumps(dict(plan=asdict(plan),
@@ -348,7 +354,6 @@ class FloodAgent(RuntimeMixin, dspy.Module):
         contact_req = self._pending_contact()
         if contact_req and not contact_req.request_message_id and (not st.urgent_flags or plan.ask_fields == [F.CONTACT] or (not plan.ask_fields and not unsolicited)):
             if plan.ask_fields == [F.CONTACT]:
-                from .conversation import render_questions
                 text = text.replace(render_questions(st, plan.ask_fields, self.templates), self.templates["contact_consent"])
             else:
                 text += "\n\n" + self.templates["contact_consent"]
@@ -362,6 +367,45 @@ class FloodAgent(RuntimeMixin, dspy.Module):
         if not self._defer_delivery:
             self.confirm_delivery()
         return self._output(text, r, st, plan, quick_replies=quick)
+
+    # ---------------------------------------------------------------- ชื่อพื้นที่ใกล้เคียง (ข้อ 6.4)
+    def _area_suggestion_for(self, plan, st: IncidentState):
+        """ชื่อที่พิมพ์ไม่พบ → เสนอชื่อตำบลใกล้เคียงจากข้อมูลอ้างอิงเป็นคำถาม ผู้ใช้ต้องยืนยันเอง"""
+        self.area_suggestion = None
+        declined, self._area_suggestion_declined = getattr(self, "_area_suggestion_declined", False), False
+        area = st.location_area.value
+        if declined or plan.ask_fields != [F.LOCATION_AREA] or not area or area.match_status.value != "not_found" \
+                or not hasattr(self.area_resolver, "suggest"):
+            return None  # ผู้ใช้เพิ่งตอบว่าไม่ใช่ → ถามชื่อพื้นที่ตรง ๆ ไม่เสนอชื่อเดิมซ้ำ
+        candidates = self.area_resolver.suggest(area.raw)
+        if not candidates:
+            return None
+        self.area_suggestion = {"incident_id": st.incident_id, "codes": [c.tambon_code for c in candidates]}
+        names = " หรือ ".join(f"ต.{c.tambon} อ.{c.amphoe}" for c in candidates)
+        text = self.templates["area_confirmation"]["suggestion"].format(candidate_area=names)
+        buttons = [QuickReply(type="postback", label=f"ต.{c.tambon}"[:20], data=POSTBACK_AREA_SUGGESTION + c.tambon_code)
+                   for c in candidates]
+        buttons.append(QuickReply(type="postback", label=self.templates["quick_replies"]["area_not_listed"],
+                                  data=POSTBACK_AREA_SUGGESTION + "no"))
+        return text, buttons
+
+    def _on_area_suggestion(self, data: str, log, r, msg_id, now):
+        pending, self.area_suggestion = self.area_suggestion, None
+        st = self.state
+        code = data.removeprefix(POSTBACK_AREA_SUGGESTION)
+        if not pending or not st or pending["incident_id"] != st.incident_id or code not in [*pending["codes"], "no"]:
+            return None
+        if code == "no":
+            self._area_suggestion_declined = True
+            log.notes.append("ผู้ใช้ปฏิเสธชื่อที่เสนอ → ถามชื่อพื้นที่ต่อตามโควตาเดิม")
+            return self._finish(st, log, r, None, msg_id=msg_id, now=now)
+        row = next(row for row in self.area_resolver.rows if row["tambon_code"] == code)
+        name = f"ตำบล{row['tambon']} อำเภอ{row['amphoe']}"
+        m = apply_updates(st, [FieldUpdate(field=F.LOCATION_AREA, status=FieldStatus.KNOWN, value={"name": name, "level": "tambon"})],
+                          message_text=f"[ยืนยันพื้นที่ {name}]", message_id=msg_id, now=now, area_resolver=self.area_resolver)
+        log.merge = m
+        log.notes.append(f"ผู้ใช้ยืนยันชื่อที่เสนอ → {name}")
+        return self._finish(m.state, log, r, m, msg_id=msg_id, now=now)
 
     # ---------------------------------------------------------------- ตำแหน่ง (ข้อ 6.10)
     def _next_msg_id(self) -> str:
@@ -483,6 +527,10 @@ class FloodAgent(RuntimeMixin, dspy.Module):
                 m = apply_updates(st, r.updates, message_text=candidate["text"], message_id=msg_id, now=now,
                                   area_resolver=self.area_resolver or unverified_area_resolver)
                 return self._finish(m.state, log, r, m, msg_id=msg_id, now=now, message_text=candidate["text"])
+        if data.startswith(POSTBACK_AREA_SUGGESTION):
+            out = self._on_area_suggestion(data, log, r, msg_id, now)
+            if out is not None:
+                return out
         if data.startswith("contact_consent="):
             st = self._contact_postback(data, now, msg_id)
             if st is not None:
@@ -532,6 +580,12 @@ class FloodAgent(RuntimeMixin, dspy.Module):
         if contact and text.strip() in {self.templates["quick_replies"]["allow_contact"], self.templates["quick_replies"]["deny_contact"]}:
             choice = "yes" if text.strip() == self.templates["quick_replies"]["allow_contact"] else "no"
             return f"contact_consent={choice}:{contact.request_id}"
+        suggestion = self.area_suggestion
+        if suggestion and self.state and suggestion["incident_id"] == self.state.incident_id:
+            if t in {"ใช่", "ใช่ค่ะ", "ใช่ครับ", "ถูกต้อง", "ถูกต้องค่ะ", "ถูกต้องครับ"} and len(suggestion["codes"]) == 1:
+                return POSTBACK_AREA_SUGGESTION + suggestion["codes"][0]
+            if t in {q["area_not_listed"], "ไม่ใช่ค่ะ", "ไม่ใช่ครับ"}:
+                return POSTBACK_AREA_SUGGESTION + "no"
         if self._pending_request("confirm_unsolicited", now):
             return {q["allow_location"]: POSTBACK_ALLOW_LOCATION, q["deny_location"]: POSTBACK_DENY_LOCATION}.get(t)
         if self._pending_request("ask_location", now):
@@ -541,9 +595,15 @@ class FloodAgent(RuntimeMixin, dspy.Module):
 
     # ---------------------------------------------------------------- กรณีพิเศษ
     def _other_incident(self, r: ExtractionResult, state: IncidentState, message_text="") -> bool:
+        active = state.location_area.value
+        # ระบบขอชื่อพื้นที่ใหม่เพราะชื่อเดิมไม่พบหรือกำกวม → ชื่อที่ตอบมาคือคำตอบของเคสนี้ ไม่ใช่เหตุอื่น (ข้อ 6.4)
+        pending = self.pending_question
+        if (active is not None and active.match_status.value in {"not_found", "ambiguous"} and r.target != "new_incident"
+                and pending and pending.incident_id == state.incident_id and F.LOCATION_AREA in pending.field_names
+                and any(u.field == F.LOCATION_AREA for u in r.updates)):
+            return False
         if r.target == "unclear":
             return True
-        active = state.location_area.value
         if active is None:
             return False
         from .schemas import AreaMention

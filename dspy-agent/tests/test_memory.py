@@ -87,7 +87,47 @@ def test_area_resolver_is_pluggable():
 
 
 def test_info_only_dropped_when_real_need_present():
-    assert coerce_value(F.NEEDS, ["info_only", "food_water"], message_text="") == [Need.FOOD_WATER]
+    assert coerce_value(F.NEEDS, ["info_only", "food_water"], message_text="ขออาหาร") == [Need.FOOD_WATER]
+
+
+def test_situation_tags_need_supporting_words():
+    tags = lambda text, given: coerce_value(F.SITUATION, {"tags": given}, message_text=text).tags
+    # ผู้ใช้บอกแค่น้ำเข้าบ้าน Gemini เติม area_flooded → ตัดทิ้ง ข้อความเต็มยังเก็บ
+    assert tags("น้ำท่วมเข้าบ้านแล้วค่ะ สูงประมาณเข่า อยู่ตำบลน้ำตาล", ["water_in_house", "area_flooded"]) == [SituationTag.WATER_IN_HOUSE]
+    # คำพ้องความหมายยังรองรับ
+    assert tags("น้ำเข้าห้องนอนแล้ว", ["water_in_house"]) == [SituationTag.WATER_IN_HOUSE]
+    assert tags("ถนนหน้าหมู่บ้านท่วมหมด รถเข้าไม่ได้", ["area_flooded", "road_blocked"]) == [SituationTag.AREA_FLOODED, SituationTag.ROAD_BLOCKED]
+    assert tags("น้ำขึ้นเร็วมาก ไหลเชี่ยว", ["water_rising", "strong_current"]) == [SituationTag.WATER_RISING, SituationTag.STRONG_CURRENT]
+    # คำที่ซ้อน: "หมู่บ้านน้ำท่วม" ไม่ใช่น้ำเข้าบ้าน, "หมู่ 3" ไม่ใช่หมู
+    assert tags("ถนนเข้าหมู่บ้านน้ำท่วม", ["water_in_house"]) == []
+    assert tags("หมู่ 3 น้ำท่วม", ["livestock_affected"]) == []
+    # tag ที่ผู้ใช้เคยบอกในข้อความ situation เดิมยังอยู่
+    assert coerce_value(F.SITUATION, {"tags": ["water_in_house"]}, message_text="ชั้นบนยังแห้ง",
+                        prior_text="น้ำเข้าบ้าน").tags == [SituationTag.WATER_IN_HOUSE]
+
+
+@pytest.mark.parametrize("value, text, level", [
+    ("ตำบลน้ำตาล อำเภออินทร์บุรี", "อยู่ตำบลน้ำตาล อำเภออินทร์บุรี", "tambon"),        # Gemini ส่งแค่ชื่อ
+    ({"name": "น้ำตาล", "level": "unspecified"}, "อยู่ ต. น้ำตาลค่ะ", "tambon"),           # คำนำหน้าอยู่ในข้อความ
+    ({"name": "ตำบลทับยา", "level": "amphoe"}, "บ้านอยู่ตำบลทับยา", "tambon"),           # คำนำหน้าชนะค่าที่ Gemini เดา
+    ({"name": "อำเภออินทร์บุรี"}, "อยู่อำเภออินทร์บุรี", "amphoe"),
+    ({"name": "หมู่ 3 ตำบลน้ำตาล"}, "หมู่ 3 ตำบลน้ำตาล", "village"),
+    ({"name": "จังหวัดเชียงใหม่"}, "อยู่จังหวัดเชียงใหม่", "province"),
+    ({"name": "ทับยา", "level": "tambon"}, "ทับยาค่ะ", "tambon"),                         # ตอบสั้นต่อคำถามตำบล คงค่าเดิม
+    ({"name": "อินทร์บุรี"}, "อินทร์บุรี", "unspecified"),                              # ไม่มีคำนำหน้า ไม่เดา
+])
+def test_stated_level_follows_user_prefix(value, text, level):
+    assert coerce_value(F.LOCATION_AREA, value, message_text=text).stated_level == AreaLevel(level)
+
+
+def test_needs_without_supporting_words_are_dropped():
+    # ผู้ใช้ขอแค่อาหารและน้ำดื่ม Gemini เติม supplies มาเอง → ตัดทิ้ง ไม่ส่งต่อในรายงาน
+    assert coerce_value(F.NEEDS, ["food_water", "supplies"], message_text="อยากได้น้ำดื่มกับอาหาร") == [Need.FOOD_WATER]
+    # "ช่วยด้วย" หรือคำที่ซ้อน เช่น ยา(ย) หมอ(น) ไม่ใช่หลักฐานของ need → ไม่เหลือค่า ถามใหม่แทนการเดา
+    for text, need in [("ช่วยด้วย", "rescue"), ("ยายเดินไม่ไหว", "medical"), ("หมอนเปียกหมด", "medical")]:
+        with pytest.raises(InvalidValue):
+            coerce_value(F.NEEDS, [need], message_text=text)
+    assert coerce_value(F.NEEDS, ["other"], message_text="ขอที่ชาร์จแบต") == [Need.OTHER]  # ไม่มีรายการคำ = ไม่ตรวจ
 
 
 @pytest.mark.parametrize("field, value", [
@@ -192,7 +232,7 @@ def test_situation_same_tags_is_confirmation_but_keeps_detail():
 
 
 def test_needs_accumulate_unless_corrected():
-    s = merge(base_state(), [upd(F.NEEDS, ["rescue"])], "ช่วยด้วย", now=EARLIER).state
+    s = merge(base_state(), [upd(F.NEEDS, ["rescue"])], "ช่วยด้วย ขอเรือมารับ", now=EARLIER).state
     r = merge(s, [upd(F.NEEDS, ["food_water"])], "ขออาหารด้วย")
     assert set(r.state.needs.value) == {Need.RESCUE, Need.FOOD_WATER}
     r2 = merge(s, [upd(F.NEEDS, ["food_water"], raw="ไม่ใช่กู้ภัย ขออาหาร", is_correction=True)], "ไม่ใช่กู้ภัย ขออาหาร")
@@ -231,7 +271,7 @@ def test_invalid_update_is_rejected_others_still_applied():
 
 
 def test_duplicate_field_uses_first():
-    r = merge(base_state(), [upd(F.NEEDS, ["rescue"]), upd(F.NEEDS, ["food_water"])], "ช่วยด้วย")
+    r = merge(base_state(), [upd(F.NEEDS, ["rescue"]), upd(F.NEEDS, ["food_water"])], "ช่วยด้วย ขอเรือมารับ")
     assert r.state.needs.value == [Need.RESCUE] and len(r.rejected) == 1
 
 

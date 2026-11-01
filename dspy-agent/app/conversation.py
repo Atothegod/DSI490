@@ -187,9 +187,16 @@ def next_questions(state: IncidentState) -> list[IncidentFieldName]:
         return []
     for step in _steps(state):
         fields = [n for n in step if _askable(state, n)]
+        if F.LOCATION_AREA in fields and _area_unresolved(state):
+            return [F.LOCATION_AREA]  # ถามชื่อพื้นที่ใหม่อย่างเดียว ปุ่มข้ามพิกัดจะได้ไม่นับเป็นการตอบพื้นที่
         if fields:
             return fields[:1] if is_urgent(state) else fields[:2]
     return []
+
+
+def _area_unresolved(state: IncidentState) -> bool:
+    area = state.location_area.value
+    return bool(area and area.match_status.value in {"not_found", "ambiguous"})
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +357,9 @@ def _summary_value(state: IncidentState, name: IncidentFieldName, tpl: dict) -> 
         return None
     v = f.value
     if name == F.LOCATION_AREA:
+        # ชื่อที่ยังจับคู่กับข้อมูลอ้างอิงไม่ได้ต้องบอกผู้ใช้ก่อนยืนยัน ไม่ให้ดูเหมือนข้อมูลที่ยืนยันแล้ว
+        if v.match_status.value in {"unverified", "not_found", "ambiguous"}:
+            return tpl["area_unverified"].format(area=v.raw)
         return v.raw
     if name == F.LOCATION_LANDMARK:
         return v
@@ -386,6 +396,9 @@ def render_summary(state: IncidentState, templates: dict, missing: Iterable[Inci
 def render_questions(state: IncidentState, fields: list[IncidentFieldName], templates: dict) -> str:
     """ใช้ combined_questions เมื่อ field ที่ถามตรงกับกลุ่ม มิฉะนั้นใช้คำถามรายข้อ เลือกแบบตามจำนวนครั้งที่ถามแล้ว"""
     names = [n.value for n in fields]
+    if names == [F.LOCATION_AREA.value] and _area_unresolved(state):
+        # บอกผู้ใช้ตรง ๆ ว่าชื่อที่พิมพ์ตรวจสอบไม่ได้ หรือตรงกับหลายแห่ง (ข้อ 6.4)
+        return templates["area_confirmation"][state.location_area.value.match_status.value]
     for group in templates["combined_questions"].values():
         if sorted(group["fields"]) == sorted(names):
             return group["text"]

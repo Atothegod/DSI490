@@ -25,7 +25,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
-from .schemas import Hotline, IncidentState, UrgentFlag, UrgentFlagRecord, UrgentFlagSource
+from .schemas import Hotline, IncidentState, Need, SituationTag, UrgentFlag, UrgentFlagRecord, UrgentFlagSource
 
 APP_DIR = Path(__file__).resolve().parent
 KEYWORDS_PATH = APP_DIR / "safety_keywords_th.json"
@@ -137,6 +137,8 @@ class SafetyKeywords:
     correction_patterns: tuple[re.Pattern[str], ...]
     contact_requests: tuple[str, ...]
     version: str = "unknown"
+    need_cues: dict[Need, tuple[str, ...]] = field(default_factory=dict)  # need ที่ไม่มีรายการคำ = ไม่ตรวจ
+    tag_cues: dict[SituationTag, tuple[str, ...]] = field(default_factory=dict)  # tag ที่ไม่มีรายการคำ = ไม่ตรวจ
 
 
 def parse_keywords(data: dict) -> SafetyKeywords:
@@ -153,6 +155,10 @@ def parse_keywords(data: dict) -> SafetyKeywords:
         correction_patterns=tuple(re.compile(p) for p in data.get("correction_cue_patterns", [])),
         contact_requests=tuple(_fold(normalize_text(w)) for w in data.get("contact_requests", [])),
         version=str(data.get("version", "unknown")),
+        need_cues={Need(name): tuple(_fold(normalize_text(w)) for w in words if w.strip())
+                   for name, words in data.get("need_cues", {}).items()},
+        tag_cues={SituationTag(name): tuple(_fold(normalize_text(w)) for w in words if w.strip())
+                  for name, words in data.get("tag_cues", {}).items()},
     )
 
 
@@ -160,6 +166,27 @@ def parse_keywords(data: dict) -> SafetyKeywords:
 def load_keywords(path: str | Path = KEYWORDS_PATH) -> SafetyKeywords:
     with open(path, encoding="utf-8") as f:
         return parse_keywords(json.load(f))
+
+
+def _grounded(values, text: str, cues: dict) -> list:
+    folded = _fold(normalize_text(text))
+    return [v for v in values if v not in cues or any(w in folded for w in cues[v])]
+
+
+def grounded_needs(needs: Iterable[Need], text: str, keywords: SafetyKeywords | None = None) -> list[Need]:
+    """
+    ตัด need ที่ข้อความของผู้ใช้ไม่มีคำรองรับ เช่น ผู้ใช้ขอแค่ "อาหาร" แต่ Gemini ใส่ supplies มาด้วย
+    ไม่ให้ระบบเติมความต้องการเองก่อนส่งรายงาน ตัดผิดแค่ทำให้ถามซ้ำ ไม่ทำให้รายงานผิด
+    """
+    return _grounded(needs, text, (keywords or load_keywords()).need_cues)
+
+
+def grounded_tags(tags: Iterable[SituationTag], text: str, keywords: SafetyKeywords | None = None) -> list[SituationTag]:
+    """
+    ตัด situation tag ที่ข้อความของผู้ใช้ไม่มีคำรองรับ เช่น "น้ำท่วมเข้าบ้าน" ได้ water_in_house ไม่ได้ area_flooded
+    tag ใช้แค่คำนวณ priority และจัดประเภทการเปลี่ยนค่า ไม่เกี่ยวกับ urgent_flags หรือการส่งด่วน
+    """
+    return _grounded(tags, text, (keywords or load_keywords()).tag_cues)
 
 
 # ---------------------------------------------------------------------------

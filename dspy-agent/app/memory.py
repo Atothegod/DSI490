@@ -23,7 +23,7 @@ from typing import Any, Callable, Iterable
 
 from pydantic import ValidationError
 
-from .safety import correction_cue_for, normalize_text, raw_in_message
+from .safety import correction_cue_for, grounded_needs, grounded_tags, normalize_text, raw_in_message
 from .schemas import (
     REQUIRED_FIELDS,
     AffectedPeople,
@@ -47,6 +47,7 @@ from .schemas import (
     OpenIncidentBrief,
     PendingQuestion,
     Situation,
+    SituationTag,
     TrackedField,
     VulnerablePeople,
     WaterLevel,
@@ -81,21 +82,45 @@ def _clean_text(s: Any) -> str:
     return re.sub(r"\s+", " ", normalize_text(s)).strip()
 
 
+# คำนำหน้าที่ผู้ใช้พิมพ์ เรียงจากระดับละเอียดที่สุด
+_LEVEL_PREFIXES = (
+    (AreaLevel.VILLAGE, r"(?:หมู่บ้าน|หมู่ที่|หมู่\s*\d|ม\.\s*\d)"),
+    (AreaLevel.TAMBON, r"(?:ตำบล|ต\.)"),
+    (AreaLevel.AMPHOE, r"(?:อำเภอ|อ\.)"),
+    (AreaLevel.PROVINCE, r"(?:จังหวัด|จ\.)"),
+)
+
+
+def stated_area_level(mention: AreaMention, message_text: str) -> AreaLevel:
+    """
+    ระดับพื้นที่ตามคำนำหน้าที่ผู้ใช้พิมพ์จริง เช่น "ตำบลน้ำตาล" → tambon (ข้อ 6.4)
+    มีคำนำหน้าชัดเจนให้ใช้ตามนั้นแทนค่าจาก Gemini ไม่มีให้คงค่าเดิม เช่น ผู้ใช้ตอบสั้น ๆ ต่อคำถามว่าอยู่ตำบลไหน
+    """
+    first = re.escape(mention.name.split()[0])
+    for level, prefix in _LEVEL_PREFIXES:
+        if re.search(prefix, mention.name) or re.search(prefix + r"\s*" + first, message_text):
+            return level
+    return mention.level
+
+
 def coerce_value(
     name: IncidentFieldName,
     value: Any,
     *,
     message_text: str,
     area_resolver: AreaResolver = unverified_area_resolver,
+    prior_text: str = "",
 ) -> Any:
     """
     แปลง value ของ FieldUpdate เป็นชนิดที่ field ต้องการ
+    prior_text: ข้อความ situation เดิมของเคส ใช้ตรวจ tag ที่ผู้ใช้เคยบอกไว้แล้ว
     - location_area: รับ AreaMention (หรือข้อความ สำหรับ prompt รุ่นเก่า) แล้วจับคู่ด้วย area_resolver
     - situation: text ใช้ข้อความต้นฉบับของผู้ใช้เสมอ ใช้จาก Gemini เฉพาะ tags (ข้อ 6.1)
     """
     try:
         if name == F.LOCATION_AREA:
             mention = AreaMention(name=_clean_text(value)) if isinstance(value, str) else AreaMention.model_validate(value)
+            mention = mention.model_copy(update={"level": stated_area_level(mention, normalize_text(message_text))})
             return area_resolver(mention)
         if name == F.LOCATION_LANDMARK:
             return _clean_text(value)
@@ -103,12 +128,17 @@ def coerce_value(
             return Coordinates.model_validate(value)
         if name == F.SITUATION:
             tags = value.get("tags", []) if isinstance(value, dict) else []
+            # tag ที่ข้อความไม่มีคำรองรับถูกตัด ข้อความเต็มยังเก็บไว้ (ไม่กระทบ urgent_flags)
+            tags = grounded_tags([SituationTag(t) for t in tags], f"{message_text} {prior_text}")
             return Situation(text=_clean_text(message_text), tags=tags)
         if name == F.NEEDS:
             needs = [Need(v) for v in (value if isinstance(value, list) else [value])]
             if not needs:
                 raise InvalidValue("needs ต้องมีอย่างน้อยหนึ่งค่า")
-            return _normalize_needs(needs)
+            kept = grounded_needs(needs, message_text)
+            if not kept:
+                raise InvalidValue(f"needs {[n.value for n in needs]} ไม่มีคำในข้อความรองรับ ถามผู้ใช้แทนการเดา")
+            return _normalize_needs(kept)
         if name == F.AFFECTED_PEOPLE:
             return AffectedPeople.model_validate(value)
         if name == F.VULNERABLE_PEOPLE:
@@ -266,7 +296,8 @@ def apply_updates(
             continue
 
         try:
-            new_value = coerce_value(name, upd.value, message_text=message_text, area_resolver=area_resolver)
+            prior = current.value.text if name == F.SITUATION and current.value else ""
+            new_value = coerce_value(name, upd.value, message_text=message_text, area_resolver=area_resolver, prior_text=prior)
         except InvalidValue as e:
             result.rejected.append(RejectedUpdate(upd, str(e)))
             continue

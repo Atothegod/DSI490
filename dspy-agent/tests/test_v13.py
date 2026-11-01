@@ -238,10 +238,26 @@ def test_invalid_wording_or_exception_falls_back_once():
     def compose(plan):
         calls.append(plan)
         return Wording(questions={"needs":"เจ้าหน้าที่กำลังไปค่ะ"})
-    agent=make(GENERAL,composer=compose)
-    out=agent(input_text="น้ำท่วมบ้าน")
+    agent=make(ex(u("location_area","ตำบลทับยา"),u("situation",{"tags":["water_in_house"]})),composer=compose)
+    agent(input_text="น้ำท่วมบ้าน ตำบลทับยา")  # ขอพิกัด → template ไม่เรียก composer
+    out=agent(postback="location_share=skip")  # คำถามถัดไป (needs) เรียก composer แล้วตรวจไม่ผ่าน
     assert len(calls)==1 and "เจ้าหน้าที่กำลังไป" not in out.output_text
-    assert agent.templates["questions"]["location_coordinates"][0] in out.output_text
+    assert agent.templates["questions"]["needs"][0] in out.output_text
+
+
+def test_location_request_text_is_always_the_template():
+    # Gemini เรียบเรียงคำขอพิกัดไม่ได้ ข้อความที่แสดงจริง (purpose) ต้องมีข้อความตาม notice_version
+    calls=[]
+    def compose(plan):
+        calls.append(plan)
+        return Wording(acknowledgement="รับทราบค่ะ", questions={"location_coordinates":"แชร์ตำแหน่งได้ไหมคะ"})
+    agent=make(ex(u("location_area","ตำบลทับยา"),u("situation",{"tags":["water_in_house"]})),composer=compose)
+    out=agent(input_text="น้ำท่วมบ้าน ตำบลทับยา")
+    template=agent.templates["questions"]["location_coordinates"][0]
+    assert calls==[] and template in out.output_text and "แชร์ตำแหน่งได้ไหมคะ" not in out.output_text
+    req=agent.location_requests[-1]
+    assert req.notice_version==agent.templates["notice_versions"]["location_share"]=="location_share_v3"
+    assert req.purpose in out.output_text and template in req.purpose  # ข้อความแจ้งครั้งแรกต่อท้ายภายหลัง
 
 
 def test_area_summary_moves_case_without_merging_or_double_counting():
@@ -308,6 +324,102 @@ def test_verified_area_matching_is_exact_and_uses_parent_district(tmp_path):
     assert resolve(AreaMention(name="ตำบลชื่อซ้ำ อำเภออำเภอสอง",level="tambon")).tambon_code=="170201"
     assert resolve(AreaMention(name="ตำบลชื่อช้ำ",level="tambon")).match_status==AreaMatchStatus.NOT_FOUND
     assert resolve(AreaMention(name="ตำบลยังไม่ตรวจ",level="tambon")).match_status==AreaMatchStatus.NOT_FOUND
+
+
+def approved_areas(tmp_path):
+    path=tmp_path/"areas.csv"
+    with (Path(__file__).parents[1]/"app"/"areas_singburi.csv").open(encoding="utf-8-sig") as f:
+        rows=[{**r,"verified_at":NOW.isoformat(),"review_status":"approved"} for r in csv.DictReader(f)]
+    with path.open("w",encoding="utf-8",newline="") as f:
+        w=csv.DictWriter(f,fieldnames=rows[0].keys());w.writeheader();w.writerows(rows)
+    return AreaResolver(path)
+
+
+def test_not_found_area_tells_user_and_asks_area_alone(tmp_path):
+    # ผู้ใช้ต้องรู้ว่าชื่อที่พิมพ์ตรวจสอบไม่ได้ และปุ่มข้ามพิกัดต้องไม่กินโควตาถามพื้นที่
+    agent=make(ex(u("location_area","ตำบลกรุงเกษม"),u("situation",{"tags":["water_in_house"]})),
+               area_resolver=approved_areas(tmp_path),composer=False)
+    out=agent(input_text="น้ำท่วมเข้าบ้านค่ะ อยู่ตำบลกรุงเกษม")  # ไม่มีชื่อใกล้เคียง → ไม่เสนอชื่อ
+    assert agent.templates["area_confirmation"]["not_found"] in out.output_text
+    assert agent.templates["combined_questions"]["incident_location"]["text"] not in out.output_text
+    assert not out.quick_replies and agent.pending_question.field_names==[IncidentFieldName.LOCATION_AREA]
+
+
+def test_typo_area_suggests_close_name_and_matches_only_after_user_confirms(tmp_path):
+    area=lambda name: ex(u("location_area",name),u("situation",{"tags":["water_in_house"]}))
+    def start():
+        agent=make(area("ตำบลน้ำตาน อำเภออินทร์บุรี"),area("ตำบลน้ำตาน"),area_resolver=approved_areas(tmp_path),composer=False)
+        out=agent(input_text="น้ำท่วมเข้าบ้านค่ะ อยู่ตำบลน้ำตาน อำเภออินทร์บุรี")
+        return agent,out
+    agent,out=start()
+    assert "หมายถึง ต.น้ำตาล อ.อินทร์บุรี ใช่ไหมคะ" in out.output_text
+    assert [q.data for q in out.quick_replies]==["area_suggestion=170607","area_suggestion=no"]
+    assert agent.state.location_area.value.match_status==AreaMatchStatus.NOT_FOUND  # ยังไม่เลือกเอง
+    out=agent(postback="area_suggestion=170607")
+    v=agent.state.location_area.value
+    assert v.match_status==AreaMatchStatus.MATCHED and v.tambon_code=="170607" and v.stated_level==AreaLevel.TAMBON
+    # พิมพ์ "ใช่" แทนการกดปุ่ม
+    agent,_=start()
+    agent(input_text="ใช่ค่ะ")
+    assert agent.state.location_area.value.tambon_code=="170607"
+    # "ไม่ใช่" → ไม่บันทึกชื่อที่เสนอ ถามชื่อพื้นที่ต่อ
+    agent,_=start()
+    out=agent(input_text="ไม่ใช่")
+    assert agent.state.location_area.value.match_status==AreaMatchStatus.NOT_FOUND
+    assert agent.templates["area_confirmation"]["not_found"] in out.output_text and "หมายถึง" not in out.output_text
+    assert agent.area_suggestion is None and not out.quick_replies
+    # ปุ่มรหัสที่ไม่ได้เสนอ ใช้ไม่ได้
+    agent,_=start()
+    agent(postback="area_suggestion=170603")
+    assert agent.state.location_area.value.match_status==AreaMatchStatus.NOT_FOUND
+
+
+def test_summary_marks_unverified_area():
+    agent=make(ex(u("location_area","ตำบลนำตาน"),u("situation",{"tags":["water_in_house"]})),composer=False)
+    agent(input_text="น้ำท่วมเข้าบ้านค่ะ อยู่ตำบลนำตาน")
+    assert agent.state.location_area.value.match_status==AreaMatchStatus.UNVERIFIED
+    from app.conversation import render_summary
+    assert "ตำบลนำตาน (ยังตรวจสอบชื่อนี้กับข้อมูลอ้างอิงไม่ได้)" in render_summary(agent.state,agent.templates)
+
+
+def test_retyped_area_after_not_found_stays_in_same_case(tmp_path):
+    # ระบบขอชื่อพื้นที่ใหม่เพราะพิมพ์ผิด → ชื่อที่ตอบมาคือคำตอบของเคสเดิม ไม่ถามว่าเหตุเดียวกันหรือเหตุใหม่
+    agent=make(ex(u("location_area","ตำบลทัพยา"),u("situation",{"tags":["water_in_house"]})),
+               ex(u("location_area","ตำบลทับยา",raw="ตำบลทับยา"),target="unclear"),
+               area_resolver=approved_areas(tmp_path),composer=False)
+    agent(input_text="น้ำท่วมเข้าบ้านค่ะ อยู่ตำบลทัพยา")
+    first=agent.state.incident_id
+    assert agent.state.location_area.value.match_status==AreaMatchStatus.NOT_FOUND
+    out=agent(input_text="ขอโทษค่ะ ตำบลทับยา")
+    assert agent.state.incident_id==first and len(agent.incidents)==1
+    assert "เหตุใหม่" not in out.output_text
+    area=agent.state.location_area.value
+    assert area.match_status==AreaMatchStatus.MATCHED and area.tambon_code=="170603"
+
+
+def test_tag_and_area_checks_do_not_delay_urgent_handoff():
+    # Gemini ส่ง tag ที่ไม่มีคำรองรับและไม่ส่ง flag เลย → tag ถูกตัด แต่ keyword ยังจับ flag และส่งด่วนทันที
+    agent=make(ex(u("location_area",{"name":"ทับยา","level":"amphoe"}),u("situation",{"tags":["area_flooded"]})),composer=False)
+    out=agent(input_text="ช่วยด้วยค่ะ พ่อติดอยู่บนหลังคา บ้านอยู่ตำบลทับยา")
+    st=agent.state
+    assert out.incident_status==IncidentStatus.SUBMITTED and st.status==IncidentStatus.SUBMITTED
+    assert {UrgentFlag.PEOPLE_TRAPPED, UrgentFlag.HELP_REQUESTED} <= st.urgent_flag_types
+    assert st.situation.value.tags==[] and st.location_area.value.stated_level==AreaLevel.TAMBON
+    event=[r for r in agent.repository.outbox() if r.event_type==EventType.INCIDENT_SUBMITTED][0]
+    assert event.payload["trigger"]=="urgent_flags" and event.payload["report"]["priority"]["level"]=="red"
+
+
+def test_known_area_is_not_asked_again():
+    # ผู้ใช้บอกตำบลแล้ว คำถามถัดไปขอแค่พิกัด ไม่ถามหมู่บ้าน ตำบลซ้ำ (เคสด่วนถามต่อทีละ field)
+    area=u("location_area",{"name":"ตำบลน้ำตาล","level":"tambon"})
+    general=make(ex(area,u("situation",{"tags":["water_in_house"]})),composer=False)
+    out=general(input_text="น้ำเข้าบ้าน อยู่ตำบลน้ำตาล")
+    assert "หมู่บ้าน ตำบล" not in out.output_text
+    assert general.templates["questions"]["location_coordinates"][0] in out.output_text
+    urgent=make(ex(area,u("situation",{"tags":["isolated"]}),flags=["people_trapped"]),composer=False)
+    out=urgent(input_text="ยายติดอยู่ บ้านอยู่ตำบลน้ำตาล")
+    assert "หมู่บ้าน ตำบล" not in out.output_text
+    assert urgent.templates["questions"]["location_coordinates"][0] in out.output_text
 
 
 def test_unprefixed_area_names_match_without_spaces_or_prefixes(tmp_path):

@@ -38,6 +38,7 @@ class RuntimeMixin:
         self._delivery_pending = None
         self._defer_delivery = False
         self.match_candidate = None
+        self.area_suggestion = None  # ชื่อพื้นที่ที่เสนอให้ผู้ใช้ยืนยัน {incident_id, codes}
         self.last_sources = []
         self.conversation_summary = None
 
@@ -51,7 +52,8 @@ class RuntimeMixin:
                     contact_requests=dump(self.contact_requests), seen_notice_versions=self.seen_notice_versions,
                     pending_location=self.pending_location, last_reports={k:v.model_dump(mode="json") for k,v in self.last_reports.items()},
                     messages=dump(self.messages), conversation_summary=self.conversation_summary.model_dump(mode="json") if self.conversation_summary else None, deletion_requested_at=self.deletion_requested_at.isoformat() if self.deletion_requested_at else None,
-                    delivery_pending=self._delivery_pending, match_candidate=self.match_candidate)
+                    delivery_pending=self._delivery_pending, match_candidate=self.match_candidate,
+                    area_suggestion=self.area_suggestion)
 
     def _restore(self, data):
         self.conversation_id = data["conversation_id"]
@@ -71,6 +73,7 @@ class RuntimeMixin:
         self.deletion_requested_at = datetime.fromisoformat(data["deletion_requested_at"]) if data.get("deletion_requested_at") else None
         self._delivery_pending = data.get("delivery_pending")
         self.match_candidate = data.get("match_candidate")
+        self.area_suggestion = data.get("area_suggestion")
 
     def persist(self, events=()):
         self.repository.save(self.internal_user_id, self._snapshot(), events)
@@ -158,6 +161,13 @@ class RuntimeMixin:
 
     def _wording(self, plan, st, message, changes=()):
         evidence = self.knowledge.evidence_for(plan.answer_question) if plan.answer_question else []
+        # คำขอพิกัดเป็นข้อความแจ้งวัตถุประสงค์ที่ LocationShareRequest อ้าง notice_version จึงใช้ template เสมอ (ข้อ 6.10)
+        # คำถามชื่อพื้นที่ที่ตรวจสอบไม่ได้ต้องบอกผู้ใช้ตรง ๆ จึงใช้ template เช่นกัน (ข้อ 6.4)
+        area = st.location_area.value if st else None
+        location_locked = IncidentFieldName.LOCATION_COORDINATES in plan.ask_fields or (
+            IncidentFieldName.LOCATION_AREA in plan.ask_fields and area and area.match_status.value in {"not_found", "ambiguous"})
+        if location_locked and not evidence:
+            return None, None, None
         if not self.composer or not (plan.ask_fields or evidence) or (st and st.urgent_flags):
             return None, None, None
         options = {f.value:[q for q in self.templates["questions"][f.value] if q.endswith("ค่ะ")]
@@ -181,7 +191,8 @@ class RuntimeMixin:
         if answer:
             rows = [e for e in evidence if e.chunk_id in result.source_ids]
             answer += "\nแหล่งข้อมูล: " + "; ".join(f"{row.title} ({row.url})" for row in rows)
-        return result.acknowledgement or None, "\n".join(result.questions.values()) or None, answer or None
+        questions = None if location_locked else "\n".join(result.questions.values()) or None
+        return result.acknowledgement or None, questions, answer or None
 
     def _pending_contact(self):
         return next((r for r in reversed(self.contact_requests) if r.status == "pending" and self.state and r.incident_id == self.state.incident_id), None)
@@ -217,6 +228,7 @@ class RuntimeMixin:
         # Erase current data and all copies in histories, messages and pending requests.
         self.contacts, self.contact_requests, self.location_requests, self.messages, self.turns = [], [], [], [], []
         self.pending_location, self.pending_question, self.pending_confirmation, self.match_candidate = None, None, None, None
+        self.area_suggestion = None
         self.conversation_summary = None
         for key, st in self.incidents.items():
             fields = {}
