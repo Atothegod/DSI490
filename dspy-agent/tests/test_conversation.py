@@ -172,7 +172,7 @@ class TestConfirmation:
         assert plan.submit_trigger is None
         assert s.state.status == IncidentStatus.DRAFT
         assert any("ไม่รับ confirm_report" in n for n in plan.notes)
-        assert plan.ask_fields == [F.LOCATION_AREA]
+        assert plan.ask_fields == [F.LOCATION_AREA, F.LOCATION_COORDINATES]
 
     def test_summary_not_delivered_means_no_confirmation(self):
         s = Session()
@@ -211,16 +211,14 @@ class TestConfirmation:
         plan, _ = s.turn("ยืนยันค่ะ", ex(intents=["confirm_report"]))
         assert plan.submit_trigger == "user_confirmed"
 
-    def test_change_after_summary_with_new_question_asks_first(self):
+    def test_change_after_summary_does_not_repeat_optional_gps(self):
         s = Session()
         s.to_summary()
         plan, _ = s.turn("ขออพยพด้วยค่ะ", ex(upd(F.NEEDS, ["evacuation"])))
-        assert not plan.show_summary
-        assert plan.ask_fields == [F.LOCATION_COORDINATES, F.LOCATION_LANDMARK]  # ข้อมูลใหม่ทำให้มีคำถามใหม่
-        assert s.pc is None  # สรุปเดิมใช้ไม่ได้แล้ว
+        assert plan.show_summary and plan.summary_changed
+        assert F.LOCATION_COORDINATES not in plan.ask_fields
         plan, _ = s.turn("ยืนยันค่ะ", ex(intents=["confirm_report"]))
-        assert plan.submit_trigger is None  # ต้องเห็นสรุปใหม่ก่อน
-        assert plan.show_summary
+        assert plan.submit_trigger == "user_confirmed"
 
     def test_knowledge_question_keeps_waiting_confirmation(self):
         s = Session()
@@ -261,7 +259,7 @@ class TestUrgent:
         assert plan.actions[:2] == [NextAction.SUBMIT_REPORT, NextAction.ASK_FOLLOW_UP]
         assert NextAction.CONFIRM_REPORT not in plan.actions and not plan.show_summary
         assert s.state.status == IncidentStatus.SUBMITTED
-        assert plan.ask_fields == [F.LOCATION_COORDINATES, F.LOCATION_LANDMARK]
+        assert plan.ask_fields == [F.LOCATION_COORDINATES]
         assert "1111" in reply and "2222" in reply
         assert T["report_submitted"]["urgent_flags"] in reply and CONFIRM_PHRASE not in reply
         no_forbidden(reply)
@@ -284,8 +282,8 @@ class TestUrgent:
             assert plan.submit_trigger is None and not plan.show_summary
             assert NextAction.CONFIRM_REPORT not in plan.actions and CONFIRM_PHRASE not in reply
         assert asked == [
-            [F.LOCATION_COORDINATES, F.LOCATION_LANDMARK],
-            [F.AFFECTED_PEOPLE, F.VULNERABLE_PEOPLE],  # ได้จุดสังเกตแล้ว ไม่ถามพิกัดอีก
+            [F.LOCATION_COORDINATES],
+            [F.AFFECTED_PEOPLE],  # ได้จุดสังเกตแล้ว ไม่ถามพิกัดอีก
             [F.CONTACT],
             [F.NEEDS],  # help_requested เอา info_only ออกไม่ได้เพราะยังไม่เคยมี needs → ถามท้ายสุด
             [],
@@ -333,15 +331,17 @@ class TestGeneralFlow:
     def test_g01_short_report_asks_location_first(self):
         s = Session()
         plan, _ = s.turn("น้ำท่วมบ้านครับ", ex(SITUATION, intents=["report_flood"], target="new_incident"))
-        assert plan.ask_fields == [F.LOCATION_AREA] and NextAction.ASK_FOLLOW_UP in plan.actions
+        assert plan.ask_fields == [F.LOCATION_AREA, F.LOCATION_COORDINATES] and NextAction.ASK_FOLLOW_UP in plan.actions
 
-    def test_g02_many_fields_asks_only_missing_people(self):
+    def test_g02_many_fields_offers_gps_before_missing_people(self):
         s = Session()
         plan, _ = s.turn("น้ำเข้าบ้านที่ตำบลทับยา น้ำถึงเอว มีคนแก่สองคน แค่อยากแจ้งไว้ก่อน", ex(
             AREA, SITUATION, INFO_ONLY,
             upd(F.WATER_LEVEL, {"raw": "น้ำถึงเอว", "descriptor": "waist"}),
             upd(F.VULNERABLE_PEOPLE, {"present": True, "groups": [{"type": "elderly", "count": 2}]}),
             intents=["report_flood"], target="new_incident"))
+        assert plan.ask_fields == [F.LOCATION_COORDINATES]
+        plan, _ = s.turn("ข้ามค่ะ", ex(upd(F.LOCATION_COORDINATES,status="declined")))
         assert plan.ask_fields == [F.AFFECTED_PEOPLE]
 
     def test_optional_fields_asked_once_then_summary_lists_missing(self):

@@ -2,3 +2,6 @@ fastapi
 uvicorn[standard]
 dspy-ai
 python-dotenv
+pydantic>=2,<3
+psycopg[binary]>=3,<4
+httpx>=0.27,<1

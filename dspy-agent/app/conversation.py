@@ -20,7 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Iterable, Literal
 
 from pydantic import AwareDatetime
@@ -149,9 +149,11 @@ def is_urgent(state: IncidentState) -> bool:
 
 
 def _askable(state: IncidentState, name: IncidentFieldName) -> bool:
+    if name == F.LOCATION_AREA and state.location_area.value and state.location_area.value.match_status.value in {"ambiguous", "not_found"}:
+        return state.location_area.ask_count < 2
     if not can_ask_now(state, name):
         return False
-    return name in REQUIRED or state.tracked_field(name).ask_count == 0
+    return True
 
 
 def _known(state: IncidentState, name: IncidentFieldName) -> bool:
@@ -169,9 +171,7 @@ def _steps(state: IncidentState) -> list[tuple[IncidentFieldName, ...]]:
     people = (F.AFFECTED_PEOPLE, F.VULNERABLE_PEOPLE)
     if is_urgent(state):
         return [(F.LOCATION_AREA,), precise, people, (F.CONTACT,), (F.NEEDS,)]
-    steps = [(F.LOCATION_AREA,), (F.SITUATION,), (F.NEEDS,), people]
-    if _wants_precise_location(state):
-        steps.append(precise)
+    steps = [(F.LOCATION_AREA, F.LOCATION_COORDINATES), (F.SITUATION,), (F.NEEDS,), people]
     steps.append((F.WATER_LEVEL,))
     return steps
 
@@ -188,7 +188,7 @@ def next_questions(state: IncidentState) -> list[IncidentFieldName]:
     for step in _steps(state):
         fields = [n for n in step if _askable(state, n)]
         if fields:
-            return fields[:2]
+            return fields[:1] if is_urgent(state) else fields[:2]
     return []
 
 
@@ -282,6 +282,8 @@ def plan_turn(
         plan.missing_fields = missing_required(state)
     if plan.answer_question:
         plan.actions.append(NextAction.ANSWER_QUESTION)
+    if is_urgent(state):
+        plan.ask_fields = plan.ask_fields[:1]
     if not plan.actions:
         plan.actions.append(NextAction.NONE)
     return plan
@@ -294,7 +296,7 @@ def _plan_draft(
     pc: PendingConfirmation | None,
     data_changed: bool,
 ) -> None:
-    waiting = confirmation_is_waiting(pc, state)
+    waiting = confirmation_is_waiting(pc, state) and state.updated_at - pc.asked_at < timedelta(hours=24)
     unchanged = waiting and summary_fingerprint(state) == pc.summary_fingerprint
     wants_confirm = Intent.CONFIRM_REPORT in extraction.intents
 
@@ -402,6 +404,8 @@ def render_reply(
     templates: dict | None = None,
     ack_text: str | None = None,
     answer_text: str | None = None,
+    question_text: str | None = None,
+    delivery_text: str | None = None,
 ) -> str:
     """
     ack_text / answer_text: ข้อความที่ Gemini เรียบเรียงแล้วและผ่านการตรวจ ถ้าไม่มีใช้ template สำรอง
@@ -414,19 +418,21 @@ def render_reply(
         parts.append(render_hotline_notice(plan.hotline_flags, hotlines, t))
     elif plan.contact_answer:
         parts.append(render_contact_answer(hotlines, t))
-    if ack_text or plan.ack:
+    if (ack_text or plan.ack) and not is_urgent(state):
         parts.append(ack_text or t["acknowledgements"][plan.ack])
     if plan.answer_question:
         # สำรองเมื่อยังไม่มีคำตอบจาก RAG: แนะนำช่องทางติดต่อ (ไม่แสดงเบอร์ซ้ำถ้ามีข้อความด่วนแล้ว)
         parts.append(answer_text or t["knowledge_unavailable"].format(
             hotline_text="" if plan.hotline_flags else format_hotline_text(hotlines)).strip())
-    if plan.submit_trigger:
+    if delivery_text:
+        parts.append(delivery_text)
+    elif plan.submit_trigger:
         parts.append(t["report_submitted"][plan.submit_trigger])
     if plan.show_summary:
         summary = t["report_confirmation"].format(report_summary=render_summary(state, t, plan.missing_fields))
         parts.append(f"{t['summary_changed']}\n{summary}" if plan.summary_changed else summary)
     elif plan.ask_fields:
-        parts.append(render_questions(state, plan.ask_fields, t))
+        parts.append(question_text or render_questions(state, plan.ask_fields, t))
     return "\n\n".join(p for p in parts if p)
 
 

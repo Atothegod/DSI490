@@ -51,6 +51,7 @@ from .schemas import (
     VulnerablePeople,
     WaterLevel,
     max_asks,
+    ServiceScope,
 )
 
 F = IncidentFieldName
@@ -303,11 +304,17 @@ def apply_updates(
                 new_value=dump(stored), reported_at=now,
             ))
 
+    if "location_area" in patch and patch["location_area"].value:
+        area = patch["location_area"].value
+        scope = ServiceScope.OUT_OF_PROVINCE if area.match_status == AreaMatchStatus.OUT_OF_PROVINCE else (
+            ServiceScope.IN_PROVINCE if area.match_status == AreaMatchStatus.MATCHED else ServiceScope.UNVERIFIED)
+    else:
+        scope = state.service_scope
     if patch or result.contact_updates:
         result.state = IncidentState.model_validate({
             **state.model_dump(),
             **{k: v.model_dump() for k, v in patch.items()},
-            "updated_at": now, "last_activity_at": now,
+            "updated_at": now, "last_activity_at": now, "service_scope": scope,
         })
     return result
 
@@ -317,9 +324,15 @@ def apply_updates(
 # ---------------------------------------------------------------------------
 
 
+def ask_limit(state: IncidentState, name: IncidentFieldName) -> int:
+    if name in (F.AFFECTED_PEOPLE, F.VULNERABLE_PEOPLE):
+        return 2 if state.urgent_flags or set(state.needs.value or []) & {Need.RESCUE, Need.EVACUATION, Need.MEDICAL} else 1
+    return max_asks(name)
+
+
 def can_ask_now(state: IncidentState, name: IncidentFieldName) -> bool:
     f = state.tracked_field(name)
-    return f.can_ask and f.ask_count < max_asks(name)
+    return f.can_ask and f.ask_count < ask_limit(state, name)
 
 
 def record_questions_asked(
@@ -344,7 +357,7 @@ def close_unanswered(state: IncidentState, pending: PendingQuestion | None) -> I
     patch = {}
     for name in pending.field_names:
         f = state.tracked_field(name)
-        if f.status == FieldStatus.NOT_ASKED and f.ask_count >= max_asks(name):
+        if f.status == FieldStatus.NOT_ASKED and f.ask_count >= ask_limit(state, name):
             attr = "contact_ask" if name == F.CONTACT else name.value
             patch[attr] = f.model_copy(update={"status": FieldStatus.UNANSWERED}).model_dump()
     return IncidentState.model_validate({**state.model_dump(), **patch}) if patch else state

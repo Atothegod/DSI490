@@ -60,8 +60,8 @@ def flag(f="people_trapped", sources=("keyword",)) -> dict:
     return {"flag": f, "sources": list(sources), "detected_at": NOW}
 
 
-def test_schema_version_is_1_1():
-    assert SCHEMA_VERSION == "1.1"
+def test_schema_version_is_1_3():
+    assert SCHEMA_VERSION == "1.3"
 
 
 # --- 6.3 UrgentFlagRecord ----------------------------------------------------

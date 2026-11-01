@@ -1,0 +1,3 @@
+-r requirements.txt
+ipywidgets>=8,<9
+ipykernel>=6,<8

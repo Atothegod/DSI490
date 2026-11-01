@@ -5,6 +5,7 @@
 """
 
 import json
+import re
 from datetime import datetime
 
 import pytest
@@ -30,6 +31,7 @@ from app.schemas import (  # noqa: E402
 T = load_templates()
 NOW = datetime(2026, 10, 30, 12, 0, tzinfo=BANGKOK_TZ)
 HOTLINES = [Hotline(key="a", name="สายด่วนทดสอบ ก", number="1111", source_url="https://example.org", verified_at=NOW)]
+PHONE = re.compile(r"0?81[-\s]?234[-\s]?5678")  # เบอร์สมมติที่ใช้ในทดสอบ ทุกรูปแบบ
 FORBIDDEN = ["เจ้าหน้าที่กำลังไป", "กำลังส่งเจ้าหน้าที่", "ได้รับความช่วยเหลือแล้ว", "ทีมกู้ภัยกำลังเดินทาง"]
 
 
@@ -46,7 +48,7 @@ def u(field, value=None, status="known", raw=None, is_correction=False):
 def make(*answers):
     lm = DummyLM(list(answers))
     dspy.configure(lm=lm)
-    return FloodAgent(hotlines=HOTLINES), lm
+    return FloodAgent(hotlines=HOTLINES, composer=False), lm
 
 
 def prompts(lm) -> str:
@@ -60,7 +62,7 @@ AREA = u("location_area", "ตำบลทับยา อำเภออิน�
 def test_guy01_style_greeting_without_incident():
     agent, _ = make(g(intents=["general_conversation"], target="none"))
     output = agent(input_text="สวัสดีค่ะ")
-    assert output.output_text == T["greeting"]
+    assert output.output_text == T["greeting"] + "\n\n" + T["privacy_notice"]
     assert output.incident_id is None and agent.state is None
 
 
@@ -75,9 +77,9 @@ def test_prompt_contains_new_rules():
 def test_g01_first_report_asks_location():
     agent, _ = make(g(SIT, intents=["report_flood"], target="new_incident"))
     output = agent(input_text="น้ำท่วมบ้านค่ะ")
-    assert output.output_text.endswith(T["questions"]["location_area"][0])
+    assert T["combined_questions"]["incident_location"]["text"] in output.output_text
     assert output.incident_status == IncidentStatus.DRAFT
-    assert output.pending_question.field_names == [F.LOCATION_AREA]
+    assert output.pending_question.field_names == [F.LOCATION_AREA, F.LOCATION_COORDINATES]
     assert agent.state.situation.value.text == "น้ำท่วมบ้านค่ะ"  # ข้อความเต็มของผู้ใช้ ไม่ใช่ที่ Gemini ตัด
 
 
@@ -98,7 +100,7 @@ def test_general_flow_to_confirmation_and_submit():
     assert NextAction.CONFIRM_REPORT in out.next_actions and "ทับยา" in out.output_text
     out = agent(input_text="ถูกต้องค่ะ")
     assert out.incident_status == IncidentStatus.SUBMITTED
-    assert T["report_submitted"]["user_confirmed"] in out.output_text
+    assert T["delivery_status"]["pending"] in out.output_text
     assert not [c for c in FORBIDDEN if c in out.output_text]
 
 
@@ -115,14 +117,16 @@ def test_urgent_submits_immediately_and_never_asks_confirmation():
     out = agent(input_text="ยายติดอยู่บนหลังคา ช่วยด้วย เบอร์ 081-234-5678")
     assert out.incident_status == IncidentStatus.SUBMITTED
     assert out.next_actions[:2] == [NextAction.SUBMIT_REPORT, NextAction.ASK_FOLLOW_UP]
-    assert "1111" in out.output_text and T["report_submitted"]["urgent_flags"] in out.output_text
+    assert "1111" in out.output_text and T["delivery_status"]["pending"] in out.output_text
     assert "กรุณายืนยันให้ส่งรายงาน" not in out.output_text
     assert "ยายติดอยู่บนหลังคา" in agent.state.situation.value.text
     assert agent.state.needs.status == FieldStatus.NOT_ASKED  # info_only ถูกเอาออก ไม่เดา rescue
     # เบอร์: ไม่ถึง Gemini ไม่อยู่ใน state ไม่อยู่ในคำตอบ แต่เก็บใน ContactRecord
-    assert "081" not in prompts(lm) and "5678" not in prompts(lm)
-    assert "081" not in agent.state.model_dump_json() and "081" not in out.output_text
-    assert agent.contacts[0].phone == "0812345678" and agent.state.contact_ask.status == FieldStatus.KNOWN
+    # ตรวจด้วยเลขหมายเต็ม ไม่ใช่ "081" เพราะ id สุ่มแบบ hex อาจมี "081" อยู่โดยบังเอิญ
+    for text in (prompts(lm), agent.state.model_dump_json(), out.output_text):
+        assert not PHONE.search(text)
+    assert agent.contacts == [] and agent.contact_requests[0].phone == "0812345678"
+    assert agent.state.contact_ref is None
     out = agent(input_text="หน้าวัดค่ะ")
     assert NextAction.SEND_UPDATE in out.next_actions and "1111" not in out.output_text
     assert "กรุณายืนยันให้ส่งรายงาน" not in out.output_text

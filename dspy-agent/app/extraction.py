@@ -112,6 +112,7 @@ class Extractor(dspy.Module):
     def __init__(self):
         super().__init__()
         self.predict = dspy.Predict(ExtractIntentAndSlots)
+        self.context = None
 
     def forward(
         self,
@@ -123,7 +124,7 @@ class Extractor(dspy.Module):
         return self.predict(
             history=dspy.History(messages=[]),
             # พิกัดไม่ต้องส่ง Gemini และเบอร์ไม่อยู่ใน state อยู่แล้ว (เก็บใน ContactRecord)
-            active_incident=state.model_dump_json(exclude={"location_coordinates"}) if state else "ไม่มี",
+            active_incident=self.context.model_dump_json(exclude={"active_incident":{"location_coordinates"}}) if self.context else (state.model_dump_json(exclude={"location_coordinates"}) if state else "ไม่มี"),
             pending_question=", ".join(f.value for f in pending) if pending else "ไม่มี",
             message=message,
         ).result

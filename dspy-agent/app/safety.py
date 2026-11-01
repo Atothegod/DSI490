@@ -369,3 +369,9 @@ __all__ = [
     "merge_urgent_flags", "normalize_text", "parse_keywords", "raw_in_message", "redact_phones",
     "render_contact_answer", "render_hotline_notice",
 ]
+
+
+def redact_identifiers(text: str) -> str:
+    """Additional input filtering before persistence and Gemini (6.13)."""
+    text = re.sub(r"(?<![0-9๐-๙])(?:[0-9๐-๙][ -]?){13}(?![0-9๐-๙])", "[เลขบัตรถูกปิดบัง]", text)
+    return re.sub(r"(?:บ้านเลขที่|เลขที่บ้าน|บ้านที่|เลขที่)\s*[0-9๐-๙]+(?:\s*/\s*[0-9๐-๙]+)?", "[บ้านเลขที่ถูกปิดบัง]", text)

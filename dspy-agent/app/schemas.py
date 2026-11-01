@@ -1,7 +1,7 @@
 """
 DSI490 — Agent 1 (Unified Flood Intake & Support) schemas.
 
-อ้างอิง: DSI490 — Design Decisions v1.1
+อ้างอิง: DSI490 — Design Decisions v1.3
 ไฟล์นี้เป็น "แหล่งความจริงเดียว" ของโครงสร้างข้อมูล ทั้ง Notebook และ FastAPI ต้อง import จากที่นี่
 
 โครงสร้างไฟล์
@@ -19,7 +19,7 @@ FieldChangeType / FieldChange, ask_count + FieldStatus.UNANSWERED, LocationShare
 
 หลักการ
     - Schema นี้ไม่มี business logic (merge, matching, retention) ส่วนนั้นอยู่ใน Backend Rules
-    - Agent 1 ไม่มี field severity ทุกที่ เพราะการประเมินเป็นหน้าที่ของ Agent 2
+    - Agent 1 จัด priority รายเคสด้วยกฎตามข้อ 7; Agent 2 วิเคราะห์ระดับพื้นที่
     - เวลาทั้งหมดต้องมี timezone (แนะนำ Asia/Bangkok)
 """
 
@@ -38,7 +38,7 @@ from pydantic import (
     model_validator,
 )
 
-SCHEMA_VERSION = "1.1"
+SCHEMA_VERSION = "1.3"
 BANGKOK_TZ = timezone(timedelta(hours=7), name="Asia/Bangkok")
 
 
@@ -122,6 +122,7 @@ class AreaMatchStatus(str, Enum):
     NOT_FOUND = "not_found"  # ไม่พบ ต้องขอยืนยัน
     UNVERIFIED = "unverified"  # ถามยืนยันครบแล้วยังไม่พบ รับตามที่แจ้ง
     OUT_OF_PROVINCE = "out_of_province"  # ผู้ใช้ระบุชัดว่าอยู่นอกจังหวัด
+    PENDING_TAMBON = "pending_tambon"  # GPS ยังไม่ได้รับการยืนยันตำบล
 
 
 class UrgentFlagSource(str, Enum):
@@ -182,6 +183,8 @@ class SituationTag(str, Enum):
     STRONG_CURRENT = "strong_current"
     PROPERTY_DAMAGE = "property_damage"
     LIVESTOCK_AFFECTED = "livestock_affected"
+    ELECTRICAL_HAZARD = "electrical_hazard"
+    STRUCTURAL_RISK = "structural_risk"
     OTHER = "other"
 
 
@@ -254,6 +257,7 @@ class EventType(str, Enum):
     INCIDENT_LINKED = "incident_linked"
     INCIDENT_CLOSED = "incident_closed"
     DATA_DELETION_REQUESTED = "data_deletion_requested"
+    AREA_SUMMARY_UPDATED = "area_summary_updated"
 
 
 class DeliveryStatus(str, Enum):
@@ -327,6 +331,7 @@ MAX_ASKS: dict[IncidentFieldName, int] = {
     IncidentFieldName.WATER_LEVEL: 1,
     IncidentFieldName.CONTACT: 1,
     IncidentFieldName.LOCATION_COORDINATES: 1,
+    IncidentFieldName.LOCATION_LANDMARK: 1,
 }
 
 
@@ -546,6 +551,44 @@ class HotlineNotice(StrictModel):
         return self
 
 
+class PriorityLevel(str, Enum):
+    RED = "red"
+    YELLOW = "yellow"
+    GREEN = "green"
+    WHITE = "white"
+    REVIEW = "needs_review"
+
+
+class CasePriority(StrictModel):
+    level: PriorityLevel
+    reasons: list[str] = Field(min_length=1)
+    evaluated_at: AwareDatetime
+    rules_version: str = "draft-1"
+    source: Literal["agent1_rules", "agent2", "official"] = "agent1_rules"
+    adjusted_by: str | None = None
+
+    @model_validator(mode="after")
+    def _actor(self):
+        if self.source != "agent1_rules" and not self.adjusted_by:
+            raise ValueError("manual priority requires adjusted_by")
+        return self
+
+
+class OperationalStatusRecord(StrictModel):
+    # Controlled draft vocabulary; contract still requires team agreement (8.1).
+    status: Literal["received", "in_progress", "completed", "reporter_resolved"]
+    source: Literal["agent2", "official", "reporter"]
+    recorded_by: str
+    reason: str = Field(min_length=1)
+    recorded_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def _authority(self):
+        if (self.source == "reporter") != (self.status == "reporter_resolved"):
+            raise ValueError("reporter resolution must be separate from official status")
+        return self
+
+
 class IncidentState(StrictModel):
     """
     State ภายใน Agent 1 (ชั้นที่ 1 ของ Context)
@@ -564,6 +607,12 @@ class IncidentState(StrictModel):
     related_incident_id: str | None = None  # เหตุเดิมที่ปิดไปแล้ว (ข้อ 3.1)
     close_reason: CloseReason | None = None
     service_scope: ServiceScope = ServiceScope.UNVERIFIED  # ข้อ 6.5
+
+    priority: CasePriority | None = None
+    priority_history: list[CasePriority] = Field(default_factory=list)
+    operational_status: list[OperationalStatusRecord] = Field(default_factory=list)
+    coordinates_forwarding_declined: bool = False
+    deletion_requested_at: AwareDatetime | None = None
 
     # ข้อมูลเหตุการณ์ (ข้อ 2.1)
     location_area: TrackedField[AreaRef] = Field(default_factory=TrackedField[AreaRef])
@@ -746,6 +795,19 @@ class ContactRecord(StrictModel):
         return self
 
 
+class ContactConsentRequest(StrictModel):
+    request_id: str = Field(default_factory=lambda: new_id("creq"))
+    incident_id: str
+    phone: str  # stored only here until explicit confirmation
+    purpose: str
+    notice_version: str
+    requested_at: AwareDatetime
+    request_message_id: str | None = None
+    status: Literal["pending", "granted", "declined", "expired"] = "pending"
+    response_message_id: str | None = None
+    resolved_at: AwareDatetime | None = None
+
+
 class ContactAccessLog(StrictModel):
     """ทุกครั้งที่มีการเปิดดูข้อมูลติดต่อจริง"""
 
@@ -863,6 +925,12 @@ class ReportedValue(StrictModel, Generic[T]):
     value: T | None = None
     reported_at: AwareDatetime | None = None
 
+    @model_validator(mode="after")
+    def _status_value(self):
+        if (self.status == FieldStatus.KNOWN) != (self.value is not None):
+            raise ValueError("known requires a value; other statuses require null")
+        return self
+
 
 class IncidentReport(StrictModel):
     """
@@ -881,6 +949,9 @@ class IncidentReport(StrictModel):
     service_scope: ServiceScope = ServiceScope.UNVERIFIED  # ข้อ 6.5
 
     location: ReportLocation
+    location_missing: bool = False
+    case_version: int = Field(default=1, ge=1)
+    priority: CasePriority | None = None
     situation: ReportedValue[Situation]
     needs: ReportedValue[list[Need]]
     affected_people: ReportedValue[AffectedPeople]
@@ -896,6 +967,15 @@ class IncidentReport(StrictModel):
 
     @model_validator(mode="after")
     def _contact_consistent(self) -> "IncidentReport":
+        if "case_version" not in self.model_fields_set:
+            self.case_version = self.incident_version
+        if self.case_version != self.incident_version:
+            raise ValueError("case_version must equal incident_version")
+        missing = not bool(self.location.area or self.location.landmark or self.location.coordinates)
+        if "location_missing" not in self.model_fields_set:
+            self.location_missing = missing
+        elif self.location_missing != missing:
+            raise ValueError("location_missing contradicts location")
         if self.contact_available != (self.contact_ref is not None):
             raise ValueError("contact_available ต้องตรงกับการมี contact_ref")
         if len(set(self.urgent_flags)) != len(self.urgent_flags):
@@ -907,10 +987,21 @@ class IncidentReport(StrictModel):
         return self
 
 
+def _check_report_time(report: IncidentReport, occurred_at: datetime) -> None:
+    times = [report.reported_at, report.submitted_at]
+    times.extend(getattr(report, name).reported_at for name in
+                 ("situation", "needs", "affected_people", "vulnerable_people", "water_level"))
+    if report.priority:
+        times.append(report.priority.evaluated_at)
+    if any(value and value > occurred_at for value in times):
+        raise ValueError("report contains information recorded after occurred_at")
+
+
 class _EventBase(StrictModel):
     event_id: str = Field(default_factory=lambda: new_id("evt"))
     schema_version: str = SCHEMA_VERSION
     occurred_at: AwareDatetime = Field(default_factory=now_bkk)
+    case_version: int = Field(default=1, ge=1)
 
 
 class IncidentSubmittedEvent(_EventBase):
@@ -921,12 +1012,17 @@ class IncidentSubmittedEvent(_EventBase):
 
     @model_validator(mode="after")
     def _ids_match(self) -> "IncidentSubmittedEvent":
+        _check_report_time(self.report, self.occurred_at)
+        if "case_version" not in self.model_fields_set:
+            self.case_version = self.report.case_version
+        if self.case_version != self.report.case_version:
+            raise ValueError("case_version does not match report")
         if self.report.incident_id != self.incident_id:
             raise ValueError("incident_id ไม่ตรงกับ report")
         return self
 
 
-ChangedFieldName = IncidentFieldName | Literal["urgent_flags", "service_scope"]
+ChangedFieldName = IncidentFieldName | Literal["urgent_flags", "service_scope", "priority", "contact_available", "location_consent"]
 
 
 class FieldChange(StrictModel):
@@ -963,6 +1059,13 @@ class IncidentUpdatedEvent(_EventBase):
 
     @model_validator(mode="after")
     def _ids_match(self) -> "IncidentUpdatedEvent":
+        _check_report_time(self.report, self.occurred_at)
+        if any(change.reported_at > self.occurred_at for change in self.changes):
+            raise ValueError("changes recorded after occurred_at")
+        if "case_version" not in self.model_fields_set:
+            self.case_version = self.report.case_version
+        if self.case_version != self.report.case_version:
+            raise ValueError("case_version does not match report")
         if self.report.incident_id != self.incident_id:
             raise ValueError("incident_id ไม่ตรงกับ report")
         if self.report.incident_version != self.incident_version:
@@ -1031,6 +1134,23 @@ class DataDeletionRequestedEvent(_EventBase):
         return self
 
 
+class AreaSummary(StrictModel):
+    summarized_at: AwareDatetime
+    area_level: Literal["tambon", "amphoe", "province", "unassigned"]
+    area_code: str | None
+    case_versions: dict[str, int]
+    priority_counts: dict[str, int]
+    needs: list[Need]
+    reported_people: int | None = None
+    people_counts_unverified: bool = True
+    people_may_overlap: bool = True
+
+
+class AreaSummaryUpdatedEvent(_EventBase):
+    event_type: Literal[EventType.AREA_SUMMARY_UPDATED] = EventType.AREA_SUMMARY_UPDATED
+    summary: AreaSummary
+
+
 HandoffEvent = Annotated[
     Union[
         IncidentSubmittedEvent,
@@ -1038,6 +1158,7 @@ HandoffEvent = Annotated[
         IncidentLinkedEvent,
         IncidentClosedEvent,
         DataDeletionRequestedEvent,
+        AreaSummaryUpdatedEvent,
     ],
     Field(discriminator="event_type"),
 ]
@@ -1198,6 +1319,24 @@ class ExtractionResult(StrictModel):
     question: str | None = None  # คำถามความรู้ที่ต้องตอบจาก RAG
 
 
+class QuickReply(StrictModel):
+    """
+    ปุ่มตอบด่วนใต้ข้อความ ไม่ผูกกับ LINE โดยตรง (line_adapter.py แปลงเป็น quickReply ของ LINE)
+    - location: เปิดหน้าเลือกตำแหน่ง (ผู้ใช้เลื่อนหมุดเองได้)
+    - postback: ส่ง data กลับมาให้ Backend ตรง ๆ ไม่ต้องให้ Gemini ตีความ
+    """
+
+    type: Literal["location", "postback"]
+    label: str = Field(min_length=1, max_length=20)  # LINE จำกัด 20 ตัวอักษร
+    data: str | None = None  # เฉพาะ postback
+
+    @model_validator(mode="after")
+    def _data_rules(self) -> "QuickReply":
+        if (self.type == "postback") != (self.data is not None):
+            raise ValueError("postback ต้องมี data และ location ต้องไม่มี data")
+        return self
+
+
 class AgentTurnOutput(StrictModel):
     """ผลลัพธ์ต่อ turn ที่ API คืน และใช้ทดสอบ Golden Scenarios"""
 
@@ -1213,6 +1352,7 @@ class AgentTurnOutput(StrictModel):
     delivery_status: DeliveryStatus | None = None
     sources: list[str] = Field(default_factory=list)  # chunk_id ที่ใช้ตอบ
     used_hotline_template: bool = False
+    quick_replies: list[QuickReply] = Field(default_factory=list)  # ข้อ 6.10 ปุ่มแชร์ตำแหน่ง / อนุญาต
     model: str | None = None
 
 
