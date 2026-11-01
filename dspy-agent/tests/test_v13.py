@@ -249,12 +249,13 @@ def test_area_summary_moves_case_without_merging_or_double_counting():
     agent(input_text="ยายติดอยู่")
     summaries=area_summaries(agent.last_reports.values())
     assert summaries[0].area_level == "unassigned" and len(summaries[0].case_versions)==1
+    assert summaries[0].urgent_incident_ids==list(summaries[0].case_versions)
     events=publish_summaries(agent.repository)
     assert len(events)==1
     assert publish_summaries(agent.repository)==[]
     agent.close_incident(CloseReason.USER_RESOLVED)
     events=publish_summaries(agent.repository)
-    assert events[0].summary.case_versions=={}
+    assert events[0].summary.case_versions=={} and events[0].summary.urgent_incident_ids==[]
 
 
 def test_retention_clears_coordinates_from_all_event_copies():
@@ -307,6 +308,27 @@ def test_verified_area_matching_is_exact_and_uses_parent_district(tmp_path):
     assert resolve(AreaMention(name="ตำบลชื่อซ้ำ อำเภออำเภอสอง",level="tambon")).tambon_code=="170201"
     assert resolve(AreaMention(name="ตำบลชื่อช้ำ",level="tambon")).match_status==AreaMatchStatus.NOT_FOUND
     assert resolve(AreaMention(name="ตำบลยังไม่ตรวจ",level="tambon")).match_status==AreaMatchStatus.NOT_FOUND
+
+
+def test_unprefixed_area_names_match_without_spaces_or_prefixes(tmp_path):
+    path=tmp_path/"areas.csv"
+    with (Path(__file__).parents[1]/"app"/"areas_singburi.csv").open(encoding="utf-8-sig") as f:
+        rows=[{**r,"verified_at":NOW.isoformat(),"review_status":"approved"} for r in csv.DictReader(f)]
+    with path.open("w",encoding="utf-8",newline="") as f:
+        w=csv.DictWriter(f,fieldnames=rows[0].keys());w.writeheader();w.writerows(rows)
+    resolve=AreaResolver(path)
+    status=lambda name,level="tambon":resolve(AreaMention(name=name,level=level))
+    assert {r["province_code"] for r in rows}=={"17"}
+    assert status("ทับยา อินทร์บุรี").tambon_code=="170603"
+    assert status("ทับยาอินทร์บุรี").tambon_code=="170603"
+    assert status("น้ำตาลค่ะ").tambon_code=="170607"
+    assert status("สิงห์ บางระจัน").tambon_code=="170201"
+    # Names shared by a district and a tambon, or conflicting names, still ask the user.
+    assert status("อินทร์บุรี").match_status==AreaMatchStatus.AMBIGUOUS
+    assert status("อินทร์บุรี","amphoe").amphoe_code=="1706"
+    assert status("ค่ายบางระจัน","amphoe").amphoe_code=="1703"
+    assert status("ทับยา ท่าช้าง").match_status==AreaMatchStatus.AMBIGUOUS
+    assert status("สิงห์บุรี").match_status==AreaMatchStatus.NOT_FOUND
 
 
 def test_explicit_outside_province_no_case_unless_urgent():

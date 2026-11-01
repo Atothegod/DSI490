@@ -99,7 +99,20 @@ class NotebookChat:
             self.status.value = f"ตอบแล้ว · {perf_counter() - started:.2f} วินาที"
         except Exception as exc:
             # Provider errors can contain request URLs or credentials; don't print raw exceptions.
-            self.status.value = f"ประมวลผลไม่สำเร็จ ({escape(type(exc).__name__)}) ตรวจ API key/การเชื่อมต่อ แล้วลองส่งใหม่"
+            error_name = type(exc).__name__
+            if error_name == "LMServerError":
+                hint = "บริการโมเดลตอบข้อผิดพลาดฝั่งเซิร์ฟเวอร์ รอสักครู่แล้วลองส่งอีกครั้ง"
+            elif "RateLimit" in error_name:
+                hint = "ติดโควตาหรือจำนวนคำขอ กรุณาตรวจ Usage ของ Gemini"
+            elif error_name == "LMUnsupportedModelError":
+                hint = "โมเดลหรือไลบรารีที่ใช้อยู่ไม่รองรับคำขอนี้"
+            else:
+                hint = "คำขอไม่สำเร็จ ต้องตรวจการตั้งค่าหรือรายละเอียดผู้ให้บริการเพิ่มเติม"
+            # UI-only notice: never add diagnostic text to the agent's model context.
+            self.messages.append(("assistant", f"ส่งข้อความรอบนี้ไม่สำเร็จ ({error_name}) กรุณาลองใหม่ค่ะ"))
+            self._draw()
+            self.message.value = kwargs.get("input_text", "")
+            self.status.value = f"ประมวลผลไม่สำเร็จ ({escape(error_name)}) · {hint}"
         finally:
             self._set_busy(False)
 

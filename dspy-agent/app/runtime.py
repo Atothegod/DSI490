@@ -157,7 +157,7 @@ class RuntimeMixin:
         return records[-1].delivery_status if records else None
 
     def _wording(self, plan, st, message, changes=()):
-        evidence = self.knowledge.search(plan.answer_question) if plan.answer_question else []
+        evidence = self.knowledge.evidence_for(plan.answer_question) if plan.answer_question else []
         if not self.composer or not (plan.ask_fields or evidence) or (st and st.urgent_flags):
             return None, None, None
         options = {f.value:[q for q in self.templates["questions"][f.value] if q.endswith("ค่ะ")]

@@ -90,6 +90,8 @@ def area_summaries(reports, *, now=None):
         numbers = [r.affected_people.value.count for r in cases if r.affected_people.value and r.affected_people.value.count is not None]
         result.append(AreaSummary(summarized_at=now or now_bkk(), area_level=level, area_code=code,
                                   case_versions={r.incident_id:r.case_version for r in cases}, priority_counts=dict(counts),
+                                  urgent_incident_ids=sorted(r.incident_id for r in cases if r.urgent_flags or
+                                                             (r.priority and r.priority.level.value == "red")),
                                   needs=sorted({n for r in cases for n in r.needs.value or []}, key=lambda n:n.value),
                                   reported_people=sum(numbers) if numbers else None))
     return result

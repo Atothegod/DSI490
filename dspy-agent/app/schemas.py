@@ -1138,7 +1138,8 @@ class AreaSummary(StrictModel):
     summarized_at: AwareDatetime
     area_level: Literal["tambon", "amphoe", "province", "unassigned"]
     area_code: str | None
-    case_versions: dict[str, int]
+    case_versions: dict[str, int]  # incident_id → case_version ใช้เรียกดูรายละเอียดรายเคส
+    urgent_incident_ids: list[str] = Field(default_factory=list)  # มี urgent_flags หรือ priority red
     priority_counts: dict[str, int]
     needs: list[Need]
     reported_people: int | None = None
