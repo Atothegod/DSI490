@@ -1,746 +1,609 @@
 """
-agent.py — FloodAgent: ประกอบ safety + Extraction + memory + conversation เป็น agent ตัวเดียว (ขั้นที่ 5)
+Agent 1 — Case Manager + Decision & Safety Logic (หัวข้อ 3, 5, 8, 9, 10)
 
-ใช้แบบเดียวกับ guy01.ipynb
-    agent = FloodAgent(hotlines=HOTLINES)
-    output = agent(input_text="น้ำท่วมบ้านค่ะ")
-    output.output_text
+ลำดับต่อข้อความ
+    Consent → Raw Message → Privacy Filter → Extraction (Gemini) → ground() → Merge Draft
+    → Priority Engine → Decision: ช่องทางฉุกเฉิน / คำแนะนำ KB / ให้กำลังใจ / ถาม Slot / สรุปให้ยืนยัน
 
-แชร์ตำแหน่ง / กดปุ่ม (เตรียมไว้สำหรับ LINE)
-    agent(location=(15.01, 100.34))
-    agent(postback="location_consent=yes")
-
-Runtime v1.3: repository + transactional outbox + explicit consent + draft priority.
-Standalone calls simulate successful reply delivery. LINE uses defer_delivery=True and
-confirm_delivery() only after the Reply API succeeds. Reviewed area/KB data are external.
+โค้ดเป็นผู้ตัดสินทุกอย่างที่มีผลต่อการช่วยเหลือ: สร้าง/สลับเคส, Slot ถัดไป, Priority, เบอร์ฉุกเฉิน, Version
+Gemini ใช้ 2 จุด: Extractor (สกัด + จำแนกเจตนา) และ Response Generator (เรียบเรียงคำแนะนำ/ให้กำลังใจ)
+Agent 1 ไม่ปิดเคสเอง ไม่ยืนยันแทนผู้ใช้ และไม่ส่ง Draft ให้ Pipeline
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime, timedelta
-from typing import Callable, Iterable
+import re
+from dataclasses import dataclass, field
+from datetime import timedelta
+from pathlib import Path
+from typing import Callable
 
-import dspy
-
-from .conversation import (
-    PendingConfirmation,
-    TurnPlan,
-    after_delivery,
-    apply_submission,
-    plan_turn,
-    reconcile_needs,
-    render_questions,
-    render_reply,
+from . import priority as priority_engine
+from .case import (
+    Case,
+    all_slots_satisfied,
+    diff_snapshots,
+    mark_asked,
+    missing_notice,
+    missing_slots,
+    next_slot,
+    refresh_slots,
+    summary_text,
+    version_snapshot,
 )
-from .memory import MergeResult, apply_updates, close_unanswered, unverified_area_resolver
-from .runtime import RuntimeMixin
-from .safety import redact_identifiers
-from .safety import asks_for_contact, keyword_flags, load_templates, merge_urgent_flags, redact_phones, render_contact_answer
+from .extraction import Extractor, ground, needs_answer_from_keywords
+from .knowledge import KBDoc, KnowledgeBase
+from .privacy import FilterResult, filter_text, normalize_text
+from .response import ResponseGenerator
 from .schemas import (
-    AgentTurnOutput,
-    ContactRecord,
-    ContactConsentRequest,
-    Message,
-    IncidentStatus,
-    CloseReason,
-    ServiceScope,
-    FieldChange,
-    FieldChangeType,
-    IncidentLinkedEvent,
-    AreaMatchStatus,
-    new_id,
-    Relation,
-    Coordinates,
-    ExtractionResult,
-    FieldStatus,
-    FieldUpdate,
-    Hotline,
-    IncidentFieldName,
-    IncidentState,
-    Intent,
-    LocationShareConsent,
-    LocationShareRequest,
-    MatchingStatus,
-    NextAction,
-    PendingQuestion,
+    AFFECTED_GROUPS,
+    RISK_FACTS,
+    SLOT_LABELS_TH,
+    CaseIntent,
+    CaseStatus,
+    Extraction,
+    IncidentData,
+    IntakeStatus,
+    Location,
+    MessageIntent,
     QuickReply,
-    StrictModel,
-    TrackedField,
+    SlotName,
+    SlotStatus,
+    TurnOutput,
     now_bkk,
 )
+from .store import Store, parse_time
 
-F = IncidentFieldName
-ExtractFn = Callable[[str, IncidentState | None, list[IncidentFieldName] | None], ExtractionResult]
+APP_DIR = Path(__file__).resolve().parent
+DRAFT_REMINDER_AFTER = timedelta(minutes=30)
+SUMMARY_MESSAGES = 3
+NAME_SLOTS = (SlotName.FIRST_NAME, SlotName.LAST_NAME)
+_NAME_PREFIX = re.compile(r"^(?:ผม|ดิฉัน|ฉัน|หนู|เรา)?\s*(?:ชื่อ(?:จริง)?|นามสกุล)?\s*(?:ว่า)?\s*(?:นาย|นางสาว|นาง|น\.ส\.)?\s*")
+_POLITE = re.compile(r"\s*(?:ครับ|ค่ะ|คะ|ค่า|จ้า|นะ)+\s*$")
+_NOT_A_NAME = ("น้ำ", "ท่วม", "ช่วย", "ไม่", "ทำไม", "อะไร", "ยังไง", "ไหม", "ได้", "แล้ว")
+YES = ("ใช่", "ใช้", "ได้", "ok", "โอเค", "เอา")
 
-# data ของปุ่ม Quick Reply (postback) — Backend อ่านตรง ๆ ไม่ผ่าน Gemini
-POSTBACK_SKIP_LOCATION = "location_share=skip"
-POSTBACK_ALLOW_LOCATION = "location_consent=yes"
-POSTBACK_DENY_LOCATION = "location_consent=no"
-POSTBACK_AREA_SUGGESTION = "area_suggestion="  # + รหัสตำบล หรือ no
-LOCATION_REQUEST_TTL = timedelta(hours=24)  # แชร์หลังจากนี้ ถือว่าไม่ชัดว่าตอบคำขอใด
-
-
-class LocationInput(StrictModel):
-    """ตำแหน่งที่ผู้ใช้แชร์ (เทียบได้กับ LINE location message) — address ไม่ใช้"""
-
-    latitude: float
-    longitude: float
-
-    @classmethod
-    def parse(cls, value) -> "LocationInput":
-        if isinstance(value, cls):
-            return value
-        if isinstance(value, (tuple, list)) and len(value) == 2:
-            return cls(latitude=value[0], longitude=value[1])
-        if isinstance(value, dict):
-            return cls(latitude=value["latitude"], longitude=value["longitude"])
-        raise ValueError("location ต้องเป็น (latitude, longitude) หรือ {'latitude': ..., 'longitude': ...}")
+ExtractFn = Callable[[str, IncidentData, "str | None", str], Extraction]
 
 
 @dataclass
-class TurnLog:
-    """สิ่งที่เกิดขึ้นใน turn หนึ่ง ใช้ดูย้อนหลังด้วย agent.show_last()"""
+class Reply:
+    parts: list[str] = field(default_factory=list)
+    quick_replies: list[QuickReply] = field(default_factory=list)
+    kb_doc_ids: list[str] = field(default_factory=list)
 
-    user_text: str
-    redacted_text: str
-    extraction: ExtractionResult | None = None
-    merge: MergeResult | None = None
-    keyword_flags: set = field(default_factory=set)
-    new_flags: set = field(default_factory=set)
-    plan: TurnPlan | None = None
-    notes: list[str] = field(default_factory=list)
+    def add(self, text: str | None):
+        if text:
+            self.parts.append(text)
 
 
-class FloodAgent(RuntimeMixin, dspy.Module):
-    def __init__(
-        self,
-        hotlines: Iterable[Hotline],
-        *,
-        templates: dict | None = None,
-        extractor: ExtractFn | None = None,
-        internal_user_id: str = "usr_demo",
-        repository=None, sender=None, composer=None, knowledge=None, area_resolver=None,
-    ):
-        super().__init__()
-        self.hotlines = list(hotlines)
-        if not self.hotlines:
-            raise ValueError("ต้องมี hotlines อย่างน้อยหนึ่งรายการ ข้อความเหตุด่วนต้องแสดงช่องทางฉุกเฉินได้เสมอ")
-        self.templates = templates or load_templates()
-        real_extractor = extractor is None
-        if extractor is None:
-            from .extraction import Extractor  # โหลดเฉพาะเมื่อใช้ Gemini จริง
-            extractor = Extractor()
-        self.extract = extractor
-        self.internal_user_id = internal_user_id
-        self.reset()
-        if composer is None and real_extractor:
-            from .response import ResponseComposer
-            composer = ResponseComposer()
-        self._runtime_init(repository, sender, composer, knowledge, area_resolver)
+class Agent1:
+    def __init__(self, store: Store, knowledge: KnowledgeBase, *, extractor: ExtractFn | None = None,
+                 generator: ResponseGenerator | None = None, templates_path: Path = APP_DIR / "templates_th.json"):
+        self.store = store
+        self.kb = knowledge
+        self.extract = extractor or Extractor()
+        self.generate = generator or ResponseGenerator()
+        self.t = json.loads(Path(templates_path).read_text(encoding="utf-8"))
+        self.labels = self.t["labels"]
 
-    # ---------------------------------------------------------------- state
-    def reset(self):
-        """เริ่มบทสนทนาใหม่ (เหมือนผู้ใช้คนใหม่)"""
-        self.conversation_id = f"conv_{self.internal_user_id}"
-        self.incidents: dict[str, IncidentState] = {}
-        self.active_id: str | None = None
-        self.pending_question: PendingQuestion | None = None
-        self.pending_confirmation: PendingConfirmation | None = None
-        self.contacts: list[ContactRecord] = []  # เบอร์จริงอยู่ที่นี่เท่านั้น ไม่เข้า state และไม่ถึง Gemini
-        self.location_requests: list[LocationShareRequest] = []  # ข้อ 6.10 คำขอพิกัดที่ส่งสำเร็จ
-        self.consents: list[LocationShareConsent] = []  # ข้อ 6.10 การอนุญาตส่งพิกัด
-        self.turns: list[TurnLog] = []
-        if hasattr(self, "repository"):
-            self._runtime_defaults()
-            self.persist()
+    # ------------------------------------------------------------------
+    # Entry point
+    # ------------------------------------------------------------------
 
-    @property
-    def state(self) -> IncidentState | None:
-        return self.incidents.get(self.active_id) if self.active_id else None
-
-    def _new_incident(self, **kw) -> IncidentState:
-        s = IncidentState(internal_user_id=self.internal_user_id, conversation_id=self.conversation_id, **kw)
-        self.incidents[s.incident_id] = s
-        self.active_id = s.incident_id
-        self.pending_question = None
-        self.pending_confirmation = None
-        return s
-
-    # ---------------------------------------------------------------- turn
-    def forward(self, input_text=None, *, location=None, postback=None, defer_delivery=False):
-        self._defer_delivery = defer_delivery
-        self._delivery_pending = None
-        self.last_sources = []
-        output = self._forward_impl(input_text, location=location, postback=postback)
-        return self._public_reply(output)
-
-    def _forward_impl(
-        self,
-        input_text: str | None = None,
-        *,
-        location: LocationInput | tuple[float, float] | dict | None = None,
-        postback: str | None = None,
-    ) -> AgentTurnOutput:
-        """
-        ข้อความ 1 ข้อความจากผู้ใช้ เลือกอย่างใดอย่างหนึ่ง
-        - input_text: ข้อความตัวอักษร
-        - location: ผู้ใช้แชร์ตำแหน่ง (LINE location message) เช่น (15.01, 100.34)
-        - postback: ผู้ใช้กดปุ่ม Quick Reply เช่น "location_consent=yes"
-        """
-        if sum(x is not None for x in (input_text, location, postback)) != 1:
-            raise ValueError("ส่ง input_text, location หรือ postback อย่างใดอย่างหนึ่ง")
-        if location is not None:
-            return self._on_location(LocationInput.parse(location))
+    def handle(self, user_ref: str, *, text: str | None = None, location: tuple[float, float] | None = None,
+               postback: str | None = None) -> TurnOutput:
+        user = self.store.user(user_ref)
+        if user["consent"] != "granted":
+            return self._consent(user, text, postback)
+        if text is not None and text.strip() == self.labels["new_case"]:
+            postback = "new_case"
         if postback is not None:
-            return self._on_postback(postback)
-        if (pb := self._label_as_postback(input_text)) is not None:
-            return self._on_postback(pb)  # ผู้ใช้พิมพ์ข้อความเดียวกับป้ายปุ่ม แทนการกดปุ่ม
-        return self._on_text(input_text)
+            return self._postback(user, postback)
+        if location is not None:
+            return self._location(user, Location(latitude=location[0], longitude=location[1]))
+        return self._text(user, text or "")
 
-    def _on_text(self, input_text: str) -> AgentTurnOutput:
-        now = now_bkk()
-        msg_id = self._next_msg_id()
-        red = redact_phones(redact_identifiers(input_text))  # filter identifiers before interpreting phone-like sequences
-        red = replace(red, text=redact_identifiers(red.text))
-        log = TurnLog(user_text=red.text, redacted_text=red.text, keyword_flags=keyword_flags(red.text))
-        self.turns.append(log)
+    # ------------------------------------------------------------------
+    # Consent (หัวข้อ 7)
+    # ------------------------------------------------------------------
 
-        state = self.state if (self.state and self.state.is_open) else None
-        pending = self.pending_question.field_names if self.pending_question and state else None
-        if input_text.strip() == "ลบข้อมูลของฉัน":
-            self.delete_personal_data(now)
-            return AgentTurnOutput(output_text=self.templates["data_deleted"], intents=[Intent.DELETE_MY_DATA],
-                                   incident_id=None, incident_status=None, next_actions=[NextAction.DELETE_USER_DATA])
-        safe_state = state.model_copy(deep=True) if state else None
-        if safe_state:
-            # Defense in depth: no precise coordinates in an extractor's input object.
-            safe_state.location_coordinates = TrackedField[Coordinates]()
-        if hasattr(self.extract, "context"):
-            self.extract.context = self.context_for_extraction(state, pending, now)
-        try:
-            r = self.extract(red.text, safe_state, pending)  # 2. ✦ Gemini
-        except Exception:
-            if not log.keyword_flags:
-                raise
-            r = ExtractionResult(intents=[Intent.REPORT_FLOOD], target="active_incident" if state else "new_incident",
-                                 urgent_flags=sorted(log.keyword_flags, key=lambda f:f.value))
-        self.messages.append(Message(conversation_id=self.conversation_id, role="user", text=red.text,
-                                     incident_ids=[state.incident_id] if state else []))
-        if Intent.DELETE_MY_DATA in r.intents:
-            self.delete_personal_data(now)
-            return AgentTurnOutput(output_text=self.templates["data_deleted"], intents=r.intents,
-                                   incident_id=None, incident_status=None, next_actions=[NextAction.DELETE_USER_DATA])
-        if state and Intent.CHECK_STATUS in r.intents:
-            status = self.delivery_status(state.incident_id)
-            return AgentTurnOutput(output_text=self.templates["delivery_status"][status or "pending"], intents=r.intents,
-                                   incident_id=state.incident_id, incident_status=state.status,
-                                   delivery_status=status, next_actions=[NextAction.NONE])
-        if state and state.status == IncidentStatus.SUBMITTED and (Intent.RESOLVE_INCIDENT in r.intents or Intent.WITHDRAW_INCIDENT in r.intents):
-            st = self.close_incident(CloseReason.USER_WITHDRAWN if Intent.WITHDRAW_INCIDENT in r.intents else CloseReason.USER_RESOLVED, now)
-            return AgentTurnOutput(output_text=self.templates["incident_closed"], intents=r.intents,
-                                   incident_id=st.incident_id, incident_status=st.status, next_actions=[NextAction.CLOSE_INCIDENT])
-        log.extraction = r
+    def _consent(self, user, text, postback) -> TurnOutput:
+        reply = Reply()
+        if postback == "consent=yes":
+            user["consent"], user["consent_at"] = "granted", now_bkk().isoformat()
+            self.store.save_user(user)
+            reply.add(self.t["consent_granted"])
+        elif postback == "consent=no":
+            user["consent"], user["consent_at"] = "declined", now_bkk().isoformat()
+            self.store.save_user(user)
+            channels = [d for n in ("1669", "1784") if (d := self.kb.hotline(n))]
+            reply.add(self.t["consent_declined"] if channels else self.t["consent_declined_no_kb"])
+            self._add_channels(reply, channels)
+        else:
+            # ยังไม่ยินยอม: ไม่บันทึกข้อความ แต่ถ้ามีสัญญาณคุกคามชีวิตให้ช่องทางฉุกเฉินก่อน
+            if text and ground(Extraction(), normalize_text(text)).risk_facts.life_threat == "true":
+                if (ems := self.kb.hotline("1669")):
+                    reply.add(self.t["critical_opening"])
+                    self._add_channels(reply, [ems])
+            reply.add(self.t["privacy_notice"])
+            reply.quick_replies = [QuickReply(label=self.labels["consent_yes"], data="consent=yes"),
+                                   QuickReply(label=self.labels["consent_no"], data="consent=no")]
+        return self._output(reply)
 
-        # Reject a clearly out-of-province ordinary report before creating an incident.
-        if self.area_resolver:
-            from .schemas import AreaMention
-            area_update = next((u for u in r.updates if u.field == F.LOCATION_AREA and u.status == FieldStatus.KNOWN), None)
-            if area_update:
-                mention = AreaMention(name=area_update.value) if isinstance(area_update.value, str) else AreaMention.model_validate(area_update.value)
-                resolved = self.area_resolver(mention)
-                if resolved.match_status.value == "out_of_province" and not (log.keyword_flags or r.urgent_flags) and state is None:
-                    from .safety import format_hotline_text
-                    return AgentTurnOutput(output_text=self.templates["service_scope"]["outside_general"].format(hotline_text=format_hotline_text(self.hotlines)),
-                                           intents=r.intents, incident_id=None, incident_status=None, next_actions=[NextAction.NONE])
-        # 3. เลือก incident ที่ข้อความนี้เป็นของ
-        is_urgent_msg = bool(log.keyword_flags or r.urgent_flags)
-        has_incident_info = bool(r.updates or is_urgent_msg)
-        if state is not None and self._other_incident(r, state, red.text):
-            if not is_urgent_msg:
-                return self._ask_incident_match(log, r, state)
-            # ข้อ 3.2 — เหตุด่วนไม่หน่วงด้วยการถาม: สร้าง provisional incident ผูกกับเหตุเดิมแบบ unconfirmed
-            state = self._new_incident(created_at=now, updated_at=now, last_activity_at=now, matching_status=MatchingStatus.UNCONFIRMED,
-                                       possible_related_incident_ids=[state.incident_id])
-            log.notes.append("ไม่ชัดว่าเหตุไหน + เหตุด่วน → สร้าง provisional incident (matching_status=unconfirmed)")
-        elif state is None:
-            if not has_incident_info:
-                return self._no_incident_reply(log, r, red.text)
-            state = self._new_incident(created_at=now, updated_at=now, last_activity_at=now)
+    # ------------------------------------------------------------------
+    # Free text
+    # ------------------------------------------------------------------
 
-        # 4. merge + flags + needs + คำถามที่ไม่ได้คำตอบ
-        m = apply_updates(state, r.updates, message_text=red.text, message_id=msg_id, now=now,
-                          area_resolver=self.area_resolver or unverified_area_resolver)
-        log.merge = m
-        fl = merge_urgent_flags(m.state.urgent_flags, log.keyword_flags, r.urgent_flags,
-                                detected_at=now, message_id=msg_id)
-        log.new_flags = fl.newly_detected
-        st = IncidentState.model_validate({**m.state.model_dump(),
-                                           "urgent_flags": [x.model_dump() for x in fl.records]})
-        st, needs_change = reconcile_needs(st, fl.newly_detected, now=now, message_id=msg_id)
-        if needs_change:
-            log.notes.append("help_requested ใหม่: เอา info_only ที่ขัดกับคำขอออก (ไม่เดา rescue)")
-        if red.has_phone and not self.deletion_requested_at:
-            st = self._save_contact(st, red, now)
-            log.notes.append("พบเบอร์: รอยืนยันอนุญาต ไม่แนบรายงาน ไม่ส่ง Gemini")
-        if self.pending_location:
-            stored = self.pending_location
-            self.pending_location = None
-            if now - datetime.fromisoformat(stored["received_at"]) <= LOCATION_REQUEST_TTL:
-                loc_merge = apply_updates(st, [FieldUpdate(field=F.LOCATION_COORDINATES, status=FieldStatus.KNOWN, value=stored["coordinates"])],
-                                          message_text="[ตำแหน่ง]", message_id=stored["coordinates"]["message_id"], now=now)
-                st = loc_merge.state
-        st = close_unanswered(st, self.pending_question)
-        return self._finish(st, log, r, m, msg_id=msg_id, now=now, new_flags=fl.newly_detected,
-                            extra_changes=[needs_change] if needs_change else [], message_text=red.text)
+    def _text(self, user, text: str, *, message_id: str | None = None, reply: Reply | None = None,
+              selected: bool = False) -> TurnOutput:
+        reply = reply or Reply()
+        case = self._current_case(user)
+        f = filter_text(text)
+        if message_id is None:
+            message_id = self.store.add_raw(user["user_ref"], case.case_id if case else None, "in", "text", text)
+        user["pending_question"] = None
 
-    def _finish(
-        self,
-        st: IncidentState,
-        log: TurnLog,
-        r: ExtractionResult,
-        m: MergeResult | None,
-        *,
-        msg_id: str,
-        now,
-        new_flags=(),
-        extra_changes=(),
-        message_text: str = "",
-        ack_text: str | None = None,
-    ) -> AgentTurnOutput:
-        """5. วางแผน → ส่งรายงาน → ข้อความตอบ → บันทึกหลังส่งสำเร็จ (ใช้ร่วมกันทุกชนิดข้อความ)"""
-        st = st.model_copy(update={"updated_at":now})
-        area = st.location_area.value
-        if area and area.match_status.value in {"ambiguous", "not_found"} and st.location_area.ask_count >= 2:
-            area = area.model_copy(update={"match_status":AreaMatchStatus.UNVERIFIED, "candidates":[]})
-            st = st.model_copy(update={"location_area":st.location_area.model_copy(update={"value":area})})
-        plan = plan_turn(st, extraction=r, merge=m, new_flags=new_flags, extra_changes=extra_changes,
-                         pending_confirmation=self.pending_confirmation, message_text=message_text)
-        log.plan = plan
-        if st.service_scope == ServiceScope.OUT_OF_PROVINCE and st.status == IncidentStatus.DRAFT and not st.urgent_flags:
-            st = IncidentState.model_validate({**st.model_dump(), "status":"closed", "close_reason":"out_of_service_area", "closed_at":now})
-            self.incidents[st.incident_id] = st
-            from .safety import format_hotline_text
-            text = self.templates["service_scope"]["outside_general"].format(hotline_text=format_hotline_text(self.hotlines))
-            return self._output(text, r, st, TurnPlan(actions=[NextAction.NONE]))
-        if plan.submit_trigger:
-            st = apply_submission(st, now=now)
-        st = self._report_event(st, plan, m, now)
-        unsolicited = bool(st.location_coordinates.value and not st.location_consent_id and not st.coordinates_forwarding_declined
-                           and not self._pending_request("ask_location", now) and not self._pending_request("confirm_unsolicited", now))
-        if unsolicited and st.urgent_flags and st.location_area.value:
-            plan.ask_fields = []
-            plan.actions = [a for a in plan.actions if a != NextAction.ASK_FOLLOW_UP]
-        ack, questions, answer = self._wording(plan, st, message_text, changes=[*(m.changes if m else []), *extra_changes])
-        status = self.delivery_status(st.incident_id)
-        delivery_text = self.templates["delivery_status"][status] if status and (plan.submit_trigger or NextAction.SEND_UPDATE in plan.actions) else None
-        text = render_reply(plan, st, hotlines=self.hotlines, templates=self.templates, ack_text=ack_text or ack,
-                            question_text=questions, answer_text=answer, delivery_text=delivery_text)
-        quick = self._location_buttons() if F.LOCATION_COORDINATES in plan.ask_fields else []
-        suggestion = self._area_suggestion_for(plan, st)
-        if suggestion:
-            text = text.replace(render_questions(st, plan.ask_fields, self.templates), suggestion[0])
-            quick = suggestion[1]
-        reply_id = f"{msg_id}_reply"
-        # Store the plan, not a successful delivery, until LINE confirms.
-        self._delivery_pending = json.loads(json.dumps(dict(plan=asdict(plan),
-            incident_id=st.incident_id, reply_id=reply_id, now=now.isoformat(),
-            ask_location=bool(quick), purpose=text), default=lambda x:x.value))
-        if unsolicited and (not st.urgent_flags or st.location_area.value):
-            text += "\n\n" + self.templates["location_consent_confirm"]
-            quick = self._consent_buttons()
-            self._delivery_pending["unsolicited_location"] = True
-        contact_req = self._pending_contact()
-        if contact_req and not contact_req.request_message_id and (not st.urgent_flags or plan.ask_fields == [F.CONTACT] or (not plan.ask_fields and not unsolicited)):
-            if plan.ask_fields == [F.CONTACT]:
-                text = text.replace(render_questions(st, plan.ask_fields, self.templates), self.templates["contact_consent"])
+        if case is not None and self._direct_answer(case, f, text, reply):
+            return self._finish(user, case, reply)
+
+        ex = ground(self.extract(f.text, case.incident if case else IncidentData(),
+                                 case.pending_question if case else None,
+                                 case.conversation_summary if case else ""), f.text)
+
+        # Multi-Case: เจตนาและการยืนยันเป็นตัวแยกเคส ไม่ใช้ระยะทาง
+        actives = self.store.active_cases(user["user_ref"])
+        has_incident = bool(MessageIntent.INCIDENT in ex.intents or ex.problem or ex.needs
+                            or ex.affected_people.has_anyone() or ex.risk_facts.life_threat == "true")
+        if ex.case_intent == CaseIntent.UNCLEAR and len(actives) > 1 and not selected:
+            return self._ask_case_selection(user, actives, message_id, reply)
+        if case is None and len(actives) > 1 and has_incident and not selected:
+            return self._ask_case_selection(user, actives, message_id, reply)
+        if case is None and len(actives) == 1:
+            case = actives[0]
+        if ex.case_intent == CaseIntent.NEW_CASE and case is not None and not selected and (case.incident.problem or case.current_version):
+            case = self._open_case(user)
+            ex = ground(self.extract(f.text, case.incident, None, ""), f.text)
+        elif case is None and has_incident:
+            case = self._open_case(user)
+        if case is None:
+            # ถามหรือระบายความรู้สึกโดยยังไม่แจ้งเหตุ: ตอบได้โดยไม่สร้างเคส
+            self._support(reply, None, ex, f, set())
+            reply.add(self.t["greeting"] if not reply.parts else None)
+            return self._finish(user, None, reply)
+
+        self.store.attach_raw(message_id, case.case_id)
+        if ex.case_intent == CaseIntent.RELOCATE:
+            case.expect_relocation = True
+        newly_true = self._merge(case, ex, f)
+        self._support(reply, case, ex, f, newly_true)
+        if ex.case_intent == CaseIntent.RELOCATE and not ex.problem:
+            reply.add(self.t["relocation_ask_pin"])
+            reply.quick_replies = [QuickReply(type="location", label=self.labels["share_location"])]
+            return self._finish(user, case, reply)
+        interjected = bool({MessageIntent.QUESTION, MessageIntent.EMOTIONAL} & set(ex.intents)) and bool(reply.parts)
+        self._continue(case, reply, resumed=interjected, count_unclear=ex.count_unclear)
+        return self._finish(user, case, reply)
+
+    def _direct_answer(self, case: Case, f: FilterResult, text: str, reply: Reply) -> bool:
+        """คำตอบของคำถาม PII บันทึกตรงลง Personal Data โดยไม่ผ่าน LLM"""
+        pending = case.pending_question
+        if pending == "reuse_contact":
+            if text.strip().startswith(("ไม่", "ไม่ใช่")):
+                return self._reuse_contact(case, False, reply)
+            if text.strip().lower().startswith(YES):
+                return self._reuse_contact(case, True, reply)
+            return False
+        if case.intake_status == IntakeStatus.AWAITING_USER_INPUT and pending is None:
+            missing = [s for s in missing_slots(case) if s in NAME_SLOTS]
+            pending = missing[0].value if len(missing) == 1 and len(missing_slots(case)) == 1 else None
+        if pending == SlotName.PHONE_NUMBER.value and f.phones:
+            case.personal.phone_number = f.phones[0]
+        elif pending in (SlotName.FIRST_NAME.value, SlotName.LAST_NAME.value) and (parts := self._name_parts(text)):
+            if pending == SlotName.FIRST_NAME.value:
+                case.personal.first_name = parts[0]
+                if len(parts) == 2 and not case.personal.last_name:
+                    case.personal.last_name = parts[1]
             else:
-                text += "\n\n" + self.templates["contact_consent"]
-            quick += [QuickReply(type="postback", label=self.templates["quick_replies"]["allow_contact"], data=f"contact_consent=yes:{contact_req.request_id}"),
-                      QuickReply(type="postback", label=self.templates["quick_replies"]["deny_contact"], data=f"contact_consent=no:{contact_req.request_id}")]
-            self._delivery_pending["contact_request_id"] = contact_req.request_id
-        if st.matching_status == MatchingStatus.UNCONFIRMED:
-            for target in st.possible_related_incident_ids[:2]:
-                quick += [QuickReply(type="postback", label="เหตุเดียวกัน", data=f"incident_link=same_incident:{target}"),
-                          QuickReply(type="postback", label="เหตุเกี่ยวข้องกัน", data=f"incident_link=related:{target}")]
-        if not self._defer_delivery:
-            self.confirm_delivery()
-        return self._output(text, r, st, plan, quick_replies=quick)
-
-    # ---------------------------------------------------------------- ชื่อพื้นที่ใกล้เคียง (ข้อ 6.4)
-    def _area_suggestion_for(self, plan, st: IncidentState):
-        """ชื่อที่พิมพ์ไม่พบ → เสนอชื่อตำบลใกล้เคียงจากข้อมูลอ้างอิงเป็นคำถาม ผู้ใช้ต้องยืนยันเอง"""
-        self.area_suggestion = None
-        declined, self._area_suggestion_declined = getattr(self, "_area_suggestion_declined", False), False
-        area = st.location_area.value
-        if declined or plan.ask_fields != [F.LOCATION_AREA] or not area or area.match_status.value != "not_found" \
-                or not hasattr(self.area_resolver, "suggest"):
-            return None  # ผู้ใช้เพิ่งตอบว่าไม่ใช่ → ถามชื่อพื้นที่ตรง ๆ ไม่เสนอชื่อเดิมซ้ำ
-        candidates = self.area_resolver.suggest(area.raw)
-        if not candidates:
-            return None
-        self.area_suggestion = {"incident_id": st.incident_id, "codes": [c.tambon_code for c in candidates]}
-        names = " หรือ ".join(f"ต.{c.tambon} อ.{c.amphoe}" for c in candidates)
-        text = self.templates["area_confirmation"]["suggestion"].format(candidate_area=names)
-        buttons = [QuickReply(type="postback", label=f"ต.{c.tambon}"[:20], data=POSTBACK_AREA_SUGGESTION + c.tambon_code)
-                   for c in candidates]
-        buttons.append(QuickReply(type="postback", label=self.templates["quick_replies"]["area_not_listed"],
-                                  data=POSTBACK_AREA_SUGGESTION + "no"))
-        return text, buttons
-
-    def _on_area_suggestion(self, data: str, log, r, msg_id, now):
-        pending, self.area_suggestion = self.area_suggestion, None
-        st = self.state
-        code = data.removeprefix(POSTBACK_AREA_SUGGESTION)
-        if not pending or not st or pending["incident_id"] != st.incident_id or code not in [*pending["codes"], "no"]:
-            return None
-        if code == "no":
-            self._area_suggestion_declined = True
-            log.notes.append("ผู้ใช้ปฏิเสธชื่อที่เสนอ → ถามชื่อพื้นที่ต่อตามโควตาเดิม")
-            return self._finish(st, log, r, None, msg_id=msg_id, now=now)
-        row = next(row for row in self.area_resolver.rows if row["tambon_code"] == code)
-        name = f"ตำบล{row['tambon']} อำเภอ{row['amphoe']}"
-        m = apply_updates(st, [FieldUpdate(field=F.LOCATION_AREA, status=FieldStatus.KNOWN, value={"name": name, "level": "tambon"})],
-                          message_text=f"[ยืนยันพื้นที่ {name}]", message_id=msg_id, now=now, area_resolver=self.area_resolver)
-        log.merge = m
-        log.notes.append(f"ผู้ใช้ยืนยันชื่อที่เสนอ → {name}")
-        return self._finish(m.state, log, r, m, msg_id=msg_id, now=now)
-
-    # ---------------------------------------------------------------- ตำแหน่ง (ข้อ 6.10)
-    def _next_msg_id(self) -> str:
-        return new_id("msg")
-
-    def _location_buttons(self) -> list[QuickReply]:
-        q = self.templates["quick_replies"]
-        return [QuickReply(type="location", label=q["share_location"]),
-                QuickReply(type="postback", label=q["skip_location"], data=POSTBACK_SKIP_LOCATION)]
-
-    def _consent_buttons(self) -> list[QuickReply]:
-        q = self.templates["quick_replies"]
-        return [QuickReply(type="postback", label=q["allow_location"], data=POSTBACK_ALLOW_LOCATION),
-                QuickReply(type="postback", label=q["deny_location"], data=POSTBACK_DENY_LOCATION)]
-
-    def _open_location_request(self, st: IncidentState, *, kind: str, purpose: str, reply_id: str, now) -> None:
-        for i, old in enumerate(self.location_requests):  # คำขอเดิมที่ยังค้าง → หมดอายุ (ตอบได้แค่คำขอล่าสุด)
-            if old.incident_id == st.incident_id and old.status == "pending":
-                self.location_requests[i] = old.model_copy(update={"status": "expired", "resolved_at": now})
-        version_key = "location_share" if kind == "ask_location" else "location_consent_confirm"
-        self.location_requests.append(LocationShareRequest(
-            incident_id=st.incident_id, kind=kind, notice_version=self.templates["notice_versions"][version_key],
-            purpose=purpose, request_message_id=reply_id, requested_at=now))
-
-    def _pending_request(self, kind: str, now) -> LocationShareRequest | None:
-        """คำขอล่าสุดของเหตุที่กำลังคุย ที่ยังรอคำตอบและไม่เกิน 24 ชั่วโมง"""
-        st = self.state
-        if st is None or not st.is_open:
-            return None
-        for i in range(len(self.location_requests) - 1, -1, -1):
-            req = self.location_requests[i]
-            if req.incident_id != st.incident_id or req.status != "pending":
-                continue
-            if now - req.requested_at > LOCATION_REQUEST_TTL:
-                self.location_requests[i] = req.model_copy(update={"status": "expired", "resolved_at": now})
-                return None
-            return req if req.kind == kind else None
-        return None
-
-    def _resolve_request(self, req: LocationShareRequest, status: str, *, msg_id: str | None, now) -> LocationShareRequest:
-        done = req.model_copy(update={"status": status, "response_message_id": msg_id, "resolved_at": now})
-        LocationShareRequest.model_validate(done.model_dump())  # ตรวจกฎของ schema
-        self.location_requests[self.location_requests.index(req)] = done
-        return done
-
-    def _grant(self, st: IncidentState, req: LocationShareRequest, *, msg_id: str, now) -> IncidentState:
-        consent = LocationShareConsent.from_request(self._resolve_request(req, "granted", msg_id=msg_id, now=now))
-        self.consents.append(consent)
-        return IncidentState.model_validate({**st.model_dump(), "location_consent_id": consent.consent_id})
-
-    def _on_location(self, loc: LocationInput) -> AgentTurnOutput:
-        """ผู้ใช้แชร์ตำแหน่ง — ไม่เรียก Gemini (พิกัดไม่ต้องตีความ และไม่ส่ง Gemini)"""
-        now, msg_id = now_bkk(), self._next_msg_id()
-        log = TurnLog(user_text="[ตำแหน่ง]", redacted_text="[ตำแหน่ง]")
-        self.turns.append(log)
-        r = ExtractionResult(intents=[Intent.UPDATE_INCIDENT], target="active_incident")
-        log.extraction = r
-
-        req = self._pending_request("ask_location", now)  # ต้องหาก่อนสร้างเหตุใหม่
-        st = self.state if (self.state and self.state.is_open) else None
-        if st is None:
-            self.pending_location = {"received_at": now.isoformat(), "coordinates": {"latitude":loc.latitude, "longitude":loc.longitude,
-                                     "source":"line_location", "message_id":msg_id}}
-            return AgentTurnOutput(output_text=self.templates["location_without_incident"], intents=[Intent.GENERAL_CONVERSATION],
-                                   incident_id=None, incident_status=None, next_actions=[NextAction.NONE])
-        coords = {"latitude": loc.latitude, "longitude": loc.longitude, "source": "line_location", "message_id": msg_id}
-        # address จาก LINE ไม่เก็บ (ข้อมูลส่วนบุคคล และพิกัดเพียงพอสำหรับรายงาน)
-        m = apply_updates(st, [FieldUpdate(field=F.LOCATION_COORDINATES, status=FieldStatus.KNOWN, value=coords)],
-                          message_text="[ตำแหน่ง]", message_id=msg_id, now=now)
-        log.merge = m
-        st = m.state
-
-        if req is not None:
-            st = self._grant(st, req, msg_id=msg_id, now=now)
-            log.notes.append("แชร์ตอบคำขอที่ส่งไปแล้ว → บันทึก LocationShareConsent (แนบพิกัดในรายงานได้)")
-            st = close_unanswered(st, self.pending_question)
-            return self._finish(st, log, r, m, msg_id=msg_id, now=now,
-                                ack_text=self.templates["location_received"])
-
-        # ข้อ 6.10 — ส่งมาเองก่อนเห็นข้อความแจ้ง ยังไม่ถือว่าอนุญาต ต้องถามยืนยันก่อน
-        log.notes.append("แชร์มาเองโดยไม่มีคำขอที่รอ → ยังไม่ถือว่าอนุญาต ถามยืนยันก่อน")
-        self.incidents[st.incident_id] = st
-        reply_id = f"{msg_id}_reply"
-        text = f"{self.templates['location_received']}\n\n{self.templates['location_consent_confirm']}"
-        self._delivery_pending = dict(unsolicited_location=True, incident_id=st.incident_id, reply_id=reply_id, now=now.isoformat())
-        if not self._defer_delivery:
-            self.confirm_delivery()
-        return AgentTurnOutput(output_text=text, intents=r.intents, incident_id=st.incident_id,
-                               incident_status=st.status, matching_status=st.matching_status,
-                               urgent_flags=sorted(st.urgent_flag_types, key=lambda f: f.value),
-                               next_actions=[NextAction.NONE], pending_question=self.pending_question,
-                               quick_replies=self._consent_buttons(), model=self._model())
-
-    def _on_postback(self, data: str) -> AgentTurnOutput:
-        """ผู้ใช้กดปุ่ม — Backend ตัดสินเอง ไม่เรียก Gemini"""
-        now, msg_id = now_bkk(), self._next_msg_id()
-        safe_data = redact_identifiers(redact_phones(data).text)
-        log = TurnLog(user_text=f"[กดปุ่ม {safe_data}]", redacted_text=f"[กดปุ่ม {safe_data}]")
-        self.turns.append(log)
-        r = ExtractionResult(intents=[Intent.UPDATE_INCIDENT], target="active_incident")
-        log.extraction = r
-        if data.startswith("incident_link="):
-            relation, _, target = data.removeprefix("incident_link=").partition(":")
-            st = self.state
-            if st and st.matching_status == MatchingStatus.UNCONFIRMED and target in st.possible_related_incident_ids and relation in {"same_incident", "related"}:
-                st = st.model_copy(update={"matching_status":MatchingStatus.LINKED, "related_incident_id":target,
-                                           "incident_version":st.incident_version+1})
-                self.incidents[st.incident_id] = st
-                event = IncidentLinkedEvent(incident_id=st.incident_id, case_version=st.incident_version, linked_to=target,
-                                             relation=relation, occurred_at=now)
-                self.persist([event])
-                return self._finish(st, log, r, None, msg_id=msg_id, now=now)
-        if data in {"incident_match=new", "incident_match=same"} and self.match_candidate:
-            candidate = self.match_candidate
-            self.match_candidate = None
-            r = ExtractionResult.model_validate(candidate["extraction"])
-            st = self._new_incident(created_at=now, updated_at=now, last_activity_at=now) if data.endswith("=new") else self.state
-            if st:
-                m = apply_updates(st, r.updates, message_text=candidate["text"], message_id=msg_id, now=now,
-                                  area_resolver=self.area_resolver or unverified_area_resolver)
-                return self._finish(m.state, log, r, m, msg_id=msg_id, now=now, message_text=candidate["text"])
-        if data.startswith(POSTBACK_AREA_SUGGESTION):
-            out = self._on_area_suggestion(data, log, r, msg_id, now)
-            if out is not None:
-                return out
-        if data.startswith("contact_consent="):
-            st = self._contact_postback(data, now, msg_id)
-            if st is not None:
-                return self._finish(st, log, r, None, msg_id=msg_id, now=now)
-        kind = {POSTBACK_SKIP_LOCATION: "ask_location", POSTBACK_ALLOW_LOCATION: "confirm_unsolicited",
-                POSTBACK_DENY_LOCATION: "confirm_unsolicited"}.get(data)
-        req = self._pending_request(kind, now) if kind else None
-        if req is None:
-            log.notes.append("ปุ่มของคำขอที่ไม่ได้รอคำตอบแล้ว → ไม่ทำอะไร")
-            st = self.state
-            return AgentTurnOutput(output_text=self.templates["request_expired"], intents=r.intents,
-                                   incident_id=st.incident_id if st else None, incident_status=st.status if st else None,
-                                   next_actions=[NextAction.NONE], pending_question=self.pending_question,
-                                   model=self._model())
-        st = self.state
-        if data == POSTBACK_ALLOW_LOCATION:
-            st = self._grant(st, req, msg_id=msg_id, now=now)
-            log.notes.append("อนุญาตพิกัดที่ส่งมาก่อน → บันทึก LocationShareConsent")
-            return self._finish(st, log, r, None, msg_id=msg_id, now=now,
-                                ack_text=self.templates["acknowledgements"]["received"])
-        if data == POSTBACK_DENY_LOCATION:
-            self._resolve_request(req, "declined", msg_id=msg_id, now=now)
-            st = self._remove_coordinates(st, msg_id=msg_id, now=now)
-            st = st.model_copy(update={"coordinates_forwarding_declined":True})
-            log.notes.append("ไม่อนุญาต → ลบพิกัดออกจาก state และไม่ขอพิกัดอีก")
-            return self._finish(st, log, r, None, msg_id=msg_id, now=now,
-                                ack_text=self.templates["location_consent_declined"])
-        # ข้ามการแชร์ตำแหน่ง = ไม่สะดวกให้ข้อมูลส่วนนี้
-        self._resolve_request(req, "skipped", msg_id=msg_id, now=now)
-        m = apply_updates(st, [FieldUpdate(field=F.LOCATION_COORDINATES, status=FieldStatus.DECLINED)],
-                          message_text="[ข้าม]", message_id=msg_id, now=now)
-        log.merge = m
-        log.notes.append("ข้ามการแชร์ตำแหน่ง → location_coordinates = declined")
-        return self._finish(m.state, log, r, m, msg_id=msg_id, now=now)
-
-    def _remove_coordinates(self, st: IncidentState, *, msg_id: str, now) -> IncidentState:
-        f = st.location_coordinates
-        removed = TrackedField[Coordinates](
-            status=FieldStatus.DECLINED, updated_at=now, source_message_id=msg_id,
-            ask_count=f.ask_count, last_asked_at=f.last_asked_at)  # ไม่เก็บพิกัดไว้ใน history ด้วย
-        return IncidentState.model_validate({**st.model_dump(), "location_coordinates": removed.model_dump()})
-
-    def _label_as_postback(self, text: str) -> str | None:
-        """ผู้ใช้พิมพ์ "อนุญาต" / "ไม่อนุญาต" / "ข้าม" เองขณะมีคำขอที่รออยู่ → ถือเป็นการกดปุ่มนั้น"""
-        now, q, t = now_bkk(), self.templates["quick_replies"], text.strip()
-        contact = self._pending_contact()
-        if contact and text.strip() in {self.templates["quick_replies"]["allow_contact"], self.templates["quick_replies"]["deny_contact"]}:
-            choice = "yes" if text.strip() == self.templates["quick_replies"]["allow_contact"] else "no"
-            return f"contact_consent={choice}:{contact.request_id}"
-        suggestion = self.area_suggestion
-        if suggestion and self.state and suggestion["incident_id"] == self.state.incident_id:
-            if t in {"ใช่", "ใช่ค่ะ", "ใช่ครับ", "ถูกต้อง", "ถูกต้องค่ะ", "ถูกต้องครับ"} and len(suggestion["codes"]) == 1:
-                return POSTBACK_AREA_SUGGESTION + suggestion["codes"][0]
-            if t in {q["area_not_listed"], "ไม่ใช่ค่ะ", "ไม่ใช่ครับ"}:
-                return POSTBACK_AREA_SUGGESTION + "no"
-        if self._pending_request("confirm_unsolicited", now):
-            return {q["allow_location"]: POSTBACK_ALLOW_LOCATION, q["deny_location"]: POSTBACK_DENY_LOCATION}.get(t)
-        if self._pending_request("ask_location", now):
-            return POSTBACK_SKIP_LOCATION if t == q["skip_location"] else None
-        return None
-
-
-    # ---------------------------------------------------------------- กรณีพิเศษ
-    def _other_incident(self, r: ExtractionResult, state: IncidentState, message_text="") -> bool:
-        active = state.location_area.value
-        # ระบบขอชื่อพื้นที่ใหม่เพราะชื่อเดิมไม่พบหรือกำกวม → ชื่อที่ตอบมาคือคำตอบของเคสนี้ ไม่ใช่เหตุอื่น (ข้อ 6.4)
-        pending = self.pending_question
-        if (active is not None and active.match_status.value in {"not_found", "ambiguous"} and r.target != "new_incident"
-                and pending and pending.incident_id == state.incident_id and F.LOCATION_AREA in pending.field_names
-                and any(u.field == F.LOCATION_AREA for u in r.updates)):
+                case.personal.last_name = parts[-1]
+        else:
             return False
-        if r.target == "unclear":
-            return True
-        if active is None:
-            return False
-        from .schemas import AreaMention
-        from .safety import correction_cue_for
-        norm = lambda x: "".join(str(x).split())
-        for update in r.updates:
-            if update.field != F.LOCATION_AREA or not update.value:
-                continue
-            if update.is_correction and correction_cue_for(update.raw, message_text):
-                continue
-            mention = AreaMention(name=update.value) if isinstance(update.value,str) else AreaMention.model_validate(update.value)
-            resolved = (self.area_resolver or unverified_area_resolver)(mention)
-            if active.area_code and resolved.area_code:
-                if active.area_code != resolved.area_code:
-                    return True
-                continue
-            if norm(mention.name) not in norm(active.raw) and norm(active.raw) not in norm(mention.name):
-                return True
-        return False
-
-    def _save_contact(self, st: IncidentState, red, now) -> IncidentState:
-        # Explicit consent is separate from incident confirmation and urgent submission.
-        if st.contact_ask.status == FieldStatus.DECLINED or st.contact_ref:
-            return st
-        for old in self.contact_requests:
-            if old.incident_id == st.incident_id and old.status == "pending":
-                old.phone, old.status, old.resolved_at = "", "expired", now
-        self.contact_requests.append(ContactConsentRequest(incident_id=st.incident_id, phone=red.phones[0].normalized,
-            purpose=self.templates["contact_consent"], notice_version=self.templates["notice_versions"]["contact"], requested_at=now))
-        return st
-
-    def _ask_incident_match(self, log: TurnLog, r: ExtractionResult, state: IncidentState) -> AgentTurnOutput:
-        # ยังไม่มีขั้นตอนรับคำตอบ "เหตุเดิม/เหตุใหม่" (รอ repository.py) — ข้อความนี้ยังไม่ถูก merge
-        log.notes.append(f"target={r.target} คนละพื้นที่/ไม่ชัด: ถามเหตุเดิมหรือเหตุใหม่ ยังไม่ merge ข้อความนี้")
-        self.match_candidate = {"extraction":r.model_dump(mode="json"), "text":log.redacted_text}
-        area = state.location_area.value.raw if state.location_area.value else ""
-        text = self.templates["incident_match"].format(active_area=area or "ก่อนหน้านี้")
-        return AgentTurnOutput(output_text=text, intents=r.intents, incident_id=state.incident_id,
-                               incident_status=state.status, matching_status=state.matching_status,
-                               urgent_flags=sorted(state.urgent_flag_types, key=lambda f: f.value),
-                               next_actions=[NextAction.ASK_INCIDENT_MATCH], model=self._model(),
-                               quick_replies=[QuickReply(type="postback", label="เหตุเดิม", data="incident_match=same"),
-                                              QuickReply(type="postback", label="เหตุใหม่", data="incident_match=new")])
-
-    def _no_incident_reply(self, log: TurnLog, r: ExtractionResult, text: str) -> AgentTurnOutput:
-        """ทักทาย ถามความรู้ หรือถามช่องทางติดต่อ โดยยังไม่มีเหตุ — ไม่สร้าง incident"""
-        t, parts, actions = self.templates, [], []
-        if asks_for_contact(text):
-            parts.append(render_contact_answer(self.hotlines, t))
-        if r.question:
-            from .safety import format_hotline_text
-            plan = TurnPlan(actions=[NextAction.ANSWER_QUESTION], answer_question=r.question)
-            _, _, answer = self._wording(plan, None, text)
-            parts.append(answer or t["knowledge_unavailable"].format(hotline_text=format_hotline_text(self.hotlines)))
-            actions.append(NextAction.ANSWER_QUESTION)
-        if not parts:
-            parts.append(t["greeting"])
-        log.notes.append("ไม่มีข้อมูลเหตุการณ์ ยังไม่สร้าง incident")
-        return AgentTurnOutput(output_text="\n\n".join(parts), intents=r.intents, incident_id=None,
-                               incident_status=None, next_actions=actions or [NextAction.NONE],
-                               used_hotline_template=asks_for_contact(text), model=self._model())
-
-    def _output(self, text: str, r: ExtractionResult, st: IncidentState, plan: TurnPlan,
-                quick_replies: list[QuickReply] | None = None) -> AgentTurnOutput:
-        return AgentTurnOutput(
-            output_text=text, intents=r.intents, incident_id=st.incident_id, incident_status=st.status,
-            matching_status=st.matching_status,
-            urgent_flags=sorted(st.urgent_flag_types, key=lambda f: f.value),
-            missing_fields=plan.missing_fields, next_actions=plan.actions,
-            pending_question=self.pending_question, used_hotline_template=bool(plan.hotline_flags),
-            delivery_status=self.delivery_status(st.incident_id),
-            quick_replies=quick_replies or [], model=self._model(),
-        )
+        self._data_changed(case)
+        case.last_user_at = now_bkk()
+        reply.add(self.t["contact_received"])
+        self._continue(case, reply)
+        return True
 
     @staticmethod
-    def _model() -> str | None:
-        lm = dspy.settings.lm
-        return getattr(lm, "model", None) if lm else None
+    def _name_parts(text: str) -> list[str] | None:
+        t = _POLITE.sub("", _NAME_PREFIX.sub("", normalize_text(text).strip()))
+        parts = t.split()
+        if not 1 <= len(parts) <= 2 or "?" in t or any(w in t for w in _NOT_A_NAME):
+            return None
+        if not all(re.fullmatch(r"[ก-๙A-Za-z.\-]{2,30}", p) for p in parts):
+            return None
+        return parts
 
-    # ---------------------------------------------------------------- ดูข้างใน
-    def show_state(self):
-        s = self.state
-        if s is None:
-            print("ยังไม่มี incident")
-            return
-        print(f"incident {s.incident_id}  status={s.status.value}  matching={s.matching_status.value}"
-              f"  urgent={sorted(f.value for f in s.urgent_flag_types)}")
-        for name in IncidentFieldName:
-            f = s.tracked_field(name)
-            v = f.value
-            val = "" if v is None else json.dumps(
-                v.model_dump(mode="json", exclude_none=True) if hasattr(v, "model_dump")
-                else [x.value for x in v] if isinstance(v, list) else v, ensure_ascii=False)
-            hist = f"  (เปลี่ยน {len(f.history)} ครั้ง)" if f.history else ""
-            print(f"  {name.value:22} {f.status.value:11} ถาม {f.ask_count}  {val}{hist}")
-        if self.pending_question:
-            print("  คำถามที่ค้าง:", [f.value for f in self.pending_question.field_names])
-        if self.pending_confirmation:
-            print("  รอผู้ใช้ยืนยันสรุป")
-        reqs = [r for r in self.location_requests if r.incident_id == s.incident_id]
-        if reqs:
-            print("  คำขอพิกัด:", [f"{r.kind}:{r.status}" for r in reqs])
-        if s.location_consent_id:
-            print("  อนุญาตแนบพิกัดแล้ว:", s.location_consent_id)
-        if len(self.incidents) > 1:
-            print(f"  incident ทั้งหมด {len(self.incidents)} รายการ:", list(self.incidents))
+    # ------------------------------------------------------------------
+    # Merge Draft + Priority
+    # ------------------------------------------------------------------
 
-    def show_last(self):
-        """สิ่งที่เกิดใน turn ล่าสุด: Gemini ดึงอะไร, การเปลี่ยนค่า, flag, เหตุผลของการตัดสิน"""
-        if not self.turns:
-            print("ยังไม่มีข้อความ")
+    def _merge(self, case: Case, ex: Extraction, f: FilterResult) -> set[str]:
+        before = (case.incident.model_dump(), case.risk_facts.model_dump(), case.personal.model_dump(),
+                  case.slots[SlotName.NEEDS].status)
+        old_facts = case.risk_facts.model_dump()
+        p = case.personal
+        if f.phones and (not p.phone_number or case.pending_question == SlotName.PHONE_NUMBER.value):
+            p.phone_number = f.phones[0]
+        if f.first_names and not p.first_name:
+            p.first_name = f.first_names[0]
+        if f.last_names and not p.last_name:
+            p.last_name = f.last_names[0]
+        case.address_masked = case.address_masked or f.address_masked
+
+        if ex.problem:
+            case.incident.problem = ex.problem
+        needs_slot = case.slots[SlotName.NEEDS]
+        if ex.needs:
+            case.incident.needs = ex.needs
+            needs_slot.evidence = ex.needs_evidence
+        else:
+            answer = ex.needs_answer
+            if answer is None and case.pending_question == SlotName.NEEDS.value:
+                answer = needs_answer_from_keywords(f.text)
+            if answer and not case.incident.needs:
+                needs_slot.status = SlotStatus.ANSWERED_NONE if answer == "none" else SlotStatus.ANSWERED_UNKNOWN
+                needs_slot.answered_at = now_bkk()
+                needs_slot.evidence = answer
+        for group in AFFECTED_GROUPS:
+            if (value := getattr(ex.affected_people, group)) is not None:
+                setattr(case.incident.affected_people, group, value)
+        for fact in RISK_FACTS:
+            if (value := getattr(ex.risk_facts, fact)) != "unknown":
+                setattr(case.risk_facts, fact, value)
+                case.risk_fact_evidence[fact] = ex.risk_fact_evidence.get(fact, "")
+        case.danger_signals += [s for s in ex.danger_signals if s not in case.danger_signals]
+
+        case.last_user_at = now_bkk()
+        case.last_intents = [i.value for i in ex.intents]
+        recent = [*filter(None, case.conversation_summary.split("\n")), f.text[:200]]
+        case.conversation_summary = "\n".join(recent[-SUMMARY_MESSAGES:])
+
+        after = (case.incident.model_dump(), case.risk_facts.model_dump(), case.personal.model_dump(),
+                 case.slots[SlotName.NEEDS].status)
+        if after != before:
+            self._data_changed(case)
+        return {k for k, v in case.risk_facts.model_dump().items() if v == "true" and old_facts[k] != "true"}
+
+    def _data_changed(self, case: Case) -> None:
+        """Draft เปลี่ยน: เปิดร่างการแก้ไขถ้าเคสยืนยันแล้ว และประเมิน Priority ใหม่"""
+        if case.intake_status == IntakeStatus.CONFIRMED and not case.editing:
+            case.editing = True
+            case.draft_round += 1
+            case.reminder_sent = False
+            case.missing_notice_sent = False
+            self.store.add_event(case.case_id, "revision_draft_opened", {"base_version": case.current_version,
+                                                                         "draft_round": case.draft_round})
+        if case.intake_status in (IntakeStatus.CONFIRMED, IntakeStatus.AWAITING_USER_INPUT,
+                                  IntakeStatus.AWAITING_CONFIRMATION):
+            case.intake_status = IntakeStatus.COLLECTING
+        case.touch(changed=True)
+        refresh_slots(case)
+        result = priority_engine.evaluate(case.risk_facts, needs=case.incident.needs,
+                                          needs_status=case.slots[SlotName.NEEDS].status, danger_signals=case.danger_signals)
+        self.store.add_event(case.case_id, "priority_evaluated", {
+            "rule_id": result.rule_id, "ruleset_version": result.ruleset_version,
+            "level": result.priority.level.value if result.priority.level else None, "evaluated_at": now_bkk().isoformat()})
+        if result.priority != case.priority:
+            self.store.add_event(case.case_id, "priority_changed", {
+                "old": case.priority.level.value if case.priority.level else None,
+                "new": result.priority.level.value if result.priority.level else None, "rule_id": result.rule_id})
+        case.priority, case.priority_rule_id = result.priority, result.rule_id
+
+    # ------------------------------------------------------------------
+    # Support: ช่องทางฉุกเฉิน + คำแนะนำ KB + ให้กำลังใจ
+    # ------------------------------------------------------------------
+
+    def _support(self, reply: Reply, case: Case | None, ex: Extraction, f: FilterResult, newly_true: set[str]) -> None:
+        facts = case.risk_facts if case else ex.risk_facts
+        channels = self.kb.emergency_channels(facts, ex.intents)
+        asked_contact = [h.doc for h in self.kb.search(f.text) if h.doc.category == "emergency" and h.score >= 1.0]
+        shown = case.channels_shown if case else []
+        fresh = [d for d in dict.fromkeys(channels + asked_contact) if d.hotline not in shown or d in asked_contact]
+        if fresh and facts.life_threat == "true" and ("life_threat" in newly_true or case is None):
+            reply.add(self.t["critical_opening"])
+        self._add_channels(reply, fresh)
+        if case:
+            case.channels_shown += [d.hotline for d in fresh if d.hotline not in case.channels_shown]
+
+        query = None
+        if MessageIntent.QUESTION in ex.intents:
+            query = ex.question or f.text
+        elif newly_true & {"life_threat", "trapped", "water_rising", "unsafe_to_evacuate"}:
+            query = f.text
+        docs = [h.doc for h in self.kb.search(query, include_emergency=False)] if query else []
+        allowed = {str(getattr(case.incident.affected_people, g)) for g in AFFECTED_GROUPS} if case else set()
+        allowed |= {d.hotline for d in fresh}
+        composed = self.generate(f.text, need_empathy=MessageIntent.EMOTIONAL in ex.intents, docs=docs,
+                                 allowed_numbers=allowed, empathy_template=self.t["empathy"])
+        reply.add(composed.text)
+        reply.kb_doc_ids += composed.kb_doc_ids
+        if MessageIntent.QUESTION in ex.intents and not docs and not asked_contact:
+            reply.add(self.t["no_kb_info"])
+            fallback = [d for d in self.kb.fallback_channels() if d not in fresh]
+            if fallback:
+                reply.add(self.t["no_kb_channels"])
+                self._add_channels(reply, fallback)
+
+    def _add_channels(self, reply: Reply, docs: list[KBDoc]) -> None:
+        for d in docs:
+            reply.add(self.t["channel_line"].format(text=d.text))
+            reply.kb_doc_ids.append(d.kb_doc_id)
+
+    # ------------------------------------------------------------------
+    # Slot Filling / Confirmation
+    # ------------------------------------------------------------------
+
+    def _continue(self, case: Case, reply: Reply, *, resumed: bool = False, count_unclear: bool = False) -> None:
+        if case.case_status == CaseStatus.INACTIVE:
+            reply.add(self.t["case_closed"])
             return
-        t = self.turns[-1]
-        print(f"👤 {t.user_text}")
-        if t.redacted_text != t.user_text:
-            print(f"   🔒 ส่ง Gemini เป็น: {t.redacted_text}")
-        if t.extraction:
-            r = t.extraction
-            print(f"   ✦ intents={[i.value for i in r.intents]} target={r.target}")
-            for u in r.updates:
-                v = "" if u.value is None else json.dumps(u.value, ensure_ascii=False)
-                print(f"     - {u.field.value}: {u.status.value} {v}{' (Gemini: แก้ไข)' if u.is_correction else ''}")
-        if t.merge:
-            for c in t.merge.changes:
-                print(f"   • {c.field.value if hasattr(c.field, 'value') else c.field}: {c.change_type.value}")
-            for f in t.merge.confirmations:
-                print(f"   • {f.value}: confirmation")
-            for f, st in t.merge.status_changes.items():
-                print(f"   • {f.value}: {st.value}")
-            for rej in t.merge.rejected:
-                print(f"   ✗ ไม่รับ {rej.update.field.value}: {rej.reason}")
-        if t.keyword_flags:
-            print(f"   keyword พบ: {sorted(f.value for f in t.keyword_flags)}")
-        if t.new_flags:
-            print(f"   ⚠️ flag ใหม่: {sorted(f.value for f in t.new_flags)}")
-        if t.plan:
-            print(f"   ➜ actions={[a.value for a in t.plan.actions]}"
-                  f"{' submit=' + t.plan.submit_trigger if t.plan.submit_trigger else ''}")
-        for n in [*t.notes, *(t.plan.notes if t.plan else [])]:
-            print(f"   ℹ️ {n}")
+        if case.intake_status == IntakeStatus.CONFIRMED:
+            reply.quick_replies = [QuickReply(label=self.labels["new_case"], data="new_case")]
+            return
+        if all_slots_satisfied(case):
+            if case.intake_status == IntakeStatus.AWAITING_CONFIRMATION:
+                reply.add(self.t["awaiting_confirmation_reminder"])
+            else:
+                case.intake_status = IntakeStatus.AWAITING_CONFIRMATION
+                reply.add(summary_text(case))
+            case.pending_question = None
+            reply.quick_replies = self._confirm_buttons(case)
+            return
+        slot = next_slot(case, SlotName.AFFECTED_PEOPLE if count_unclear else None)
+        if slot in (SlotName.FIRST_NAME, SlotName.LAST_NAME, SlotName.PHONE_NUMBER) and not case.reuse_contact_asked \
+                and all(case.slots[s].status == SlotStatus.MISSING for s in (SlotName.FIRST_NAME, SlotName.LAST_NAME, SlotName.PHONE_NUMBER)) \
+                and self._previous_contact(case):
+            case.reuse_contact_asked = True
+            case.pending_question = "reuse_contact"
+            reply.add(self.t["reuse_contact"])
+            reply.quick_replies = [QuickReply(label=self.labels["yes"], data="reuse_contact=yes"),
+                                   QuickReply(label=self.labels["no"], data="reuse_contact=no")]
+            return
+        if slot is not None:
+            question = self.t["ask"]["affected_people_unclear" if count_unclear and slot == SlotName.AFFECTED_PEOPLE else slot.value]
+            if resumed and case.pending_question == slot.value:
+                question = self.t["resume_prefix"].format(label=SLOT_LABELS_TH[slot]) + question
+            mark_asked(case, slot)
+            case.intake_status = IntakeStatus.COLLECTING
+            reply.add(question)
+            if slot == SlotName.LOCATION:
+                reply.quick_replies = [QuickReply(type="location", label=self.labels["share_location"])]
+            return
+        # ถามครบ 2 ครั้งทุก Slot ที่ขาดแล้ว: แจ้งครั้งเดียว ไม่นับเป็นคำถามครั้งที่ 3
+        case.pending_question = None
+        case.intake_status = IntakeStatus.AWAITING_USER_INPUT
+        if not case.missing_notice_sent:
+            case.missing_notice_sent = True
+            missing = missing_slots(case)
+            reply.add(missing_notice(missing))
+            if SlotName.LOCATION in missing:
+                reply.quick_replies = [QuickReply(type="location", label=self.labels["share_location"])]
+
+    def _confirm_buttons(self, case: Case) -> list[QuickReply]:
+        ref = f"{case.case_id}:{case.draft_rev}"
+        return [QuickReply(label=self.labels["confirm"], data=f"confirm={ref}"),
+                QuickReply(label=self.labels["edit"], data=f"edit={ref}")]
+
+    def _confirm(self, case: Case, reply: Reply) -> None:
+        previous = self.store.latest_version(case.case_id)
+        case.current_version += 1
+        case.confirmed_at = now_bkk()
+        case.intake_status = IntakeStatus.CONFIRMED
+        case.editing = False
+        case.pending_question = None
+        snapshot = version_snapshot(case)
+        self.store.add_version(case, snapshot)
+        if previous is None:
+            self.store.add_event(case.case_id, "incident_submitted", {"current_version": case.current_version})
+        else:
+            self.store.add_event(case.case_id, "case_updated", {
+                "previous_version": previous["version"], "current_version": case.current_version,
+                "changes": diff_snapshots(previous, snapshot), "confirmed_by": "reporter"})
+        reply.add(self.t["confirmed"].format(case_id=case.case_id))
+        reply.quick_replies = [QuickReply(label=self.labels["new_case"], data="new_case")]
+
+    # ------------------------------------------------------------------
+    # Location (LINE Location Message)
+    # ------------------------------------------------------------------
+
+    def _location(self, user, loc: Location) -> TurnOutput:
+        reply = Reply()
+        case = self._current_case(user) or self._open_case(user)
+        self.store.add_raw(user["user_ref"], case.case_id, "in", "location", f"{loc.latitude},{loc.longitude}")
+        case.last_user_at = now_bkk()
+        if case.personal.location is None:
+            case.personal.location = loc
+            self._data_changed(case)
+            reply.add(self.t["location_received"])
+        elif case.expect_relocation:
+            self._relocate(case, loc, reply)
+        else:
+            # หมุดใหม่โดยไม่มีบริบท: ถามก่อน ไม่เขียนทับพิกัดเดิม
+            case.pending_location = loc
+            case.pending_question = "location_choice"
+            reply.add(self.t["location_choice"])
+            reply.quick_replies = [QuickReply(label=self.labels["relocate"], data="location_choice=relocate"),
+                                   QuickReply(label=self.labels["new_case"], data="location_choice=new")]
+            return self._finish(user, case, reply)
+        self._continue(case, reply)
+        return self._finish(user, case, reply)
+
+    def _relocate(self, case: Case, loc: Location, reply: Reply) -> None:
+        case.personal.location = loc
+        case.pending_location = None
+        case.expect_relocation = False
+        self._data_changed(case)
+        reply.add(self.t["relocated"].format(case_id=case.case_id))
+
+    # ------------------------------------------------------------------
+    # Postback (Quick Reply)
+    # ------------------------------------------------------------------
+
+    def _postback(self, user, data: str) -> TurnOutput:
+        reply = Reply()
+        key, _, value = data.partition("=")
+        case = self._current_case(user)
+        if key == "new_case":
+            case = self._open_case(user)
+            reply.add(self.t["new_case_started"].format(case_id=case.case_id))
+            return self._finish(user, case, reply)
+        if key == "case_select":
+            selected = self.store.load_case(value)
+            if selected is None or selected.user_ref != user["user_ref"] or selected.case_status != CaseStatus.ACTIVE:
+                reply.add(self.t["stale_button"])
+                return self._finish(user, case, reply)
+            user["current_case_id"] = selected.case_id
+            held, user["held_message_id"] = user["held_message_id"], None
+            reply.add(self.t["case_selected"].format(case_id=selected.case_id))
+            text = self.store.raw(held) if held else None
+            if text:
+                return self._text(user, text, message_id=held, reply=reply, selected=True)
+            self._continue(selected, reply)
+            return self._finish(user, selected, reply)
+        if key in ("confirm", "edit"):
+            case_id, _, rev = value.partition(":")
+            target = self.store.load_case(case_id)
+            if (target is None or target.user_ref != user["user_ref"] or target.intake_status != IntakeStatus.AWAITING_CONFIRMATION
+                    or str(target.draft_rev) != rev or not all_slots_satisfied(target)):
+                reply.add(self.t["stale_button"])
+                return self._finish(user, case, reply)
+            user["current_case_id"] = target.case_id
+            if key == "confirm":
+                self._confirm(target, reply)
+            else:
+                target.intake_status = IntakeStatus.COLLECTING
+                reply.add(self.t["edit_prompt"])
+            return self._finish(user, target, reply)
+        if key == "location_choice" and case is not None and case.pending_location is not None:
+            loc = case.pending_location
+            case.pending_location = None
+            case.pending_question = None
+            if value == "relocate":
+                self._relocate(case, loc, reply)
+                self._continue(case, reply)
+                self.store.save_case(case)
+                return self._finish(user, case, reply)
+            self.store.save_case(case)
+            new = self._open_case(user)
+            new.personal.location = loc
+            self._data_changed(new)
+            reply.add(self.t["new_case_started"].format(case_id=new.case_id))
+            self._continue(new, reply)
+            return self._finish(user, new, reply)
+        if key == "reuse_contact" and case is not None:
+            self._reuse_contact(case, value == "yes", reply)
+            return self._finish(user, case, reply)
+        reply.add(self.t["stale_button"])
+        return self._finish(user, case, reply)
+
+    def _reuse_contact(self, case: Case, reuse: bool, reply: Reply) -> bool:
+        """คัดลอกชื่อ นามสกุล เบอร์ จาก Personal DB ของเคสก่อนหน้าโดยตรง ไม่ผ่าน LLM"""
+        case.pending_question = None
+        case.reuse_contact_asked = True
+        previous = self._previous_contact(case) if reuse else None
+        if previous:
+            case.personal.first_name = previous.personal.first_name
+            case.personal.last_name = previous.personal.last_name
+            case.personal.phone_number = previous.personal.phone_number
+            self._data_changed(case)
+            reply.add(self.t["contact_received"])
+        self._continue(case, reply)
+        return True
+
+    def _previous_contact(self, case: Case) -> Case | None:
+        others = [c for c in self.store.active_cases(case.user_ref) if c.case_id != case.case_id
+                  and c.personal.first_name and c.personal.last_name and c.personal.phone_number]
+        return others[-1] if others else None
+
+    # ------------------------------------------------------------------
+    # Multi-Case
+    # ------------------------------------------------------------------
+
+    def _current_case(self, user) -> Case | None:
+        if not user["current_case_id"]:
+            return None
+        case = self.store.load_case(user["current_case_id"])
+        return case if case and case.case_status == CaseStatus.ACTIVE else None
+
+    def _open_case(self, user) -> Case:
+        case = self.store.new_case(user["user_ref"])
+        user["current_case_id"] = case.case_id
+        self.store.add_event(case.case_id, "case_created", {})
+        return case
+
+    def _ask_case_selection(self, user, actives: list[Case], message_id: str, reply: Reply) -> TurnOutput:
+        user["pending_question"] = "case_selection"
+        user["held_message_id"] = message_id
+        reply.add(self.t["case_selection"])
+        reply.quick_replies = [QuickReply(label=f"{c.case_id[-6:]} {(c.incident.problem or 'ยังไม่ระบุ')}"[:20],
+                                          data=f"case_select={c.case_id}") for c in actives[-13:]]
+        return self._finish(user, None, reply)
+
+    # ------------------------------------------------------------------
+    # Draft reminder (หัวข้อ 8) — เรียกจาก background job
+    # ------------------------------------------------------------------
+
+    def due_reminders(self, now=None) -> list[tuple[str, str, str]]:
+        now = now or now_bkk()
+        due = []
+        for case in self.store.all_active_cases():
+            if not case.is_draft_open or case.reminder_sent or case.intake_status == IntakeStatus.CONFIRMED:
+                continue
+            if now - parse_time(case.last_user_at) < DRAFT_REMINDER_AFTER:
+                continue
+            reply = Reply()
+            reply.add(self.t["draft_reminder"])
+            if case.critical:
+                self._add_channels(reply, self.kb.emergency_channels(case.risk_facts, []))
+            case.reminder_sent = True
+            self.store.save_case(case)
+            self.store.add_event(case.case_id, "draft_reminder_sent", {"draft_round": case.draft_round})
+            due.append((case.user_ref, case.case_id, "\n\n".join(reply.parts)))
+        return due
+
+    def close_case(self, case_id: str, *, actor: str, reason: str) -> bool:
+        """เรียกโดยเจ้าหน้าที่หลังบ้านเท่านั้น Agent 1 ไม่ปิดเคสเอง"""
+        case = self.store.load_case(case_id)
+        if case is None or case.case_status == CaseStatus.INACTIVE:
+            return False
+        case.case_status = CaseStatus.INACTIVE
+        case.touch()
+        self.store.save_case(case)
+        self.store.add_event(case_id, "case_closed", {"closed_by": actor, "reason": reason})
+        user = self.store.user(case.user_ref)
+        if user["current_case_id"] == case_id:
+            user["current_case_id"] = None
+            self.store.save_user(user)
+        return True
+
+    # ------------------------------------------------------------------
+
+    def _finish(self, user, case: Case | None, reply: Reply) -> TurnOutput:
+        if case is not None:
+            refresh_slots(case)
+            self.store.save_case(case)
+        self.store.save_user(user)
+        out = self._output(reply, case, user)
+        self.store.add_raw(user["user_ref"], case.case_id if case else None, "out", "text", out.output_text)
+        return out
+
+    def _output(self, reply: Reply, case: Case | None = None, user=None) -> TurnOutput:
+        return TurnOutput(
+            output_text="\n\n".join(reply.parts), quick_replies=reply.quick_replies,
+            case_id=case.case_id if case else None, case_status=case.case_status if case else None,
+            intake_status=case.intake_status if case else None,
+            pending_question=(user or {}).get("pending_question") or (case.pending_question if case else None),
+            missing_slots=missing_slots(case) if case else [], kb_doc_ids=list(dict.fromkeys(reply.kb_doc_ids)),
+        )

@@ -1,7 +1,10 @@
-# Lightweight DSPy Agent API
+# DSI490 — Agent 1 (Flood Incident Intake & Support)
 
-FastAPI service ของ Agent 1 (Flood Intake & Support) จังหวัดสิงห์บุรี ใช้ DSPy + Gemini 3.1 Flash-Lite
-รับข้อความทีละข้อความต่อผู้ใช้ ระบบจำบทสนทนาเองฝั่ง server จึงไม่ต้องส่ง history
+FastAPI service ของ Agent 1 บน LINE Official Account: รับแจ้งเหตุน้ำท่วม ให้คำแนะนำเบื้องต้นจาก Knowledge Base
+รับฟังความกังวล และบันทึกเคสที่ผู้ใช้ยืนยันแล้วลง PostgreSQL ใช้ DSPy + Gemini
+
+ออกแบบตามเอกสาร "DSI490 — การออกแบบ Agent 1 ฉบับปรับปรุง" ดูการแบ่ง Module และสิ่งที่ยังไม่ได้ทำที่
+[dspy-agent/docs/implementation.md](dspy-agent/docs/implementation.md)
 
 ## Run
 
@@ -9,34 +12,36 @@ FastAPI service ของ Agent 1 (Flood Intake & Support) จังหวัด
 docker compose up -d --build
 ```
 
-API จะอยู่ที่:
+API อยู่ที่ `http://localhost:8010`
 
-```txt
-http://localhost:8010
-```
-
-## Payload
+## ทดลองคุย
 
 ```bash
-curl -X POST http://localhost:8010/chat \
-  -H "Content-Type: application/json" \
-  -d '{"user_id": "test01", "input_text": "น้ำท่วมบ้าน ช่วยด้วย"}'
+curl -X POST http://localhost:8010/chat -H "Content-Type: application/json" \
+  -d '{"user_id": "test01", "postback": "consent=yes"}'
+curl -X POST http://localhost:8010/chat -H "Content-Type: application/json" \
+  -d '{"user_id": "test01", "input_text": "น้ำท่วมบ้านสูงถึงเอว ออกไม่ได้ มีเด็ก 2 คน"}'
+curl -X POST http://localhost:8010/chat -H "Content-Type: application/json" \
+  -d '{"user_id": "test01", "location": {"latitude": 14.95, "longitude": 100.36}}'
 ```
 
-ใช้ `user_id` เดิมเพื่อคุยต่อในเรื่องเดิม คำตอบเป็น `AgentTurnOutput` เช่น `output_text`, `incident_status`, `next_actions`, `urgent_flags`, `pending_question`
-
-ปรับ runtime ตาม Design Decisions v1.3: บันทึกด้วย PostgreSQL/SQLite และ transactional outbox; เมื่อยังไม่ตั้ง transport ของ Agent 2 สถานะจะเป็น pending ตามจริง
-
-ดูรายละเอียดการตั้งค่า สัญญาส่งต่อฉบับร่าง และสิ่งที่รอทีมตรวจที่ [v1.3 implementation](dspy-agent/docs/v1.3-implementation.md)
-
-ตัวอย่าง input ให้ Agent 2: [ส่งครั้งแรก](dspy-agent/agent2_input_example.json) และ [อัปเดตภายหลัง](dspy-agent/agent2_update_example.json)
+ส่ง `input_text`, `location` หรือ `postback` อย่างใดอย่างหนึ่ง ระบบโหลดเคสจาก Database เอง จึงไม่ต้องส่ง history
+คำตอบมี `output_text`, `quick_replies` (กดปุ่มโดยส่ง `data` เป็น `postback`), `case_id`, `intake_status`, `pending_question`, `missing_slots`
 
 ## Endpoints
 
 - `GET /health`
 - `POST /chat`
-- `POST /chat/reset` เริ่มบทสนทนาใหม่ของ `user_id` นั้น
+- `POST /line/webhook` ตรวจ signature และตอบผ่าน LINE Reply API
+- `POST /cases/{case_id}/close` เจ้าหน้าที่หลังบ้านปิดเคส ต้องใช้ admin bearer token
 - `GET /docs`
 
-- `POST /line/webhook` ตรวจ signature และตอบผ่าน LINE Reply API เมื่อกำหนด credentials
-- `POST /incidents/operation`, `POST /incidents/priority`, `GET /contacts/{contact_ref}` ต้องใช้ admin bearer token
+## Pipeline
+
+Pipeline ไม่เรียก API ของ Agent 1 แต่อ่านจาก PostgreSQL โดยตรง
+
+- `pipeline_confirmed_cases` — Confirmed Version ล่าสุดของแต่ละเคส (ไม่มีชื่อและเบอร์)
+- `pipeline_case_contacts` — ชื่อ นามสกุล เบอร์ เฉพาะ Role ที่ต้องติดต่อผู้แจ้ง
+- `case_events` — `incident_submitted`, `case_updated` ใช้ตรวจจับเคสใหม่และเคสที่แก้ไข
+
+สิทธิ์ Role อยู่ที่ [dspy-agent/db/pipeline_roles.sql](dspy-agent/db/pipeline_roles.sql)

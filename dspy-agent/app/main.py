@@ -1,45 +1,43 @@
 """
-FastAPI ของ Agent 1 (Flood Intake & Support)
+FastAPI ของ Agent 1 (Flood Incident Intake & Support)
 
-POST /chat        ส่งข้อความ / ตำแหน่ง / การกดปุ่ม ของผู้ใช้ 1 ครั้ง ได้คำตอบ + สถานะเหตุ (AgentTurnOutput)
-POST /chat/reset  เริ่มบทสนทนาใหม่ของผู้ใช้คนนั้น (ใช้ตอนทดสอบ)
+POST /chat                  ส่งข้อความ / ตำแหน่ง / การกดปุ่ม ของผู้ใช้ 1 ครั้ง (ใช้ทดสอบโดยไม่ผ่าน LINE)
+GET  /dev/chat              หน้าแชตจำลอง LINE เรียก /chat (ปุ่ม Quick Reply, ส่งตำแหน่ง, ดูสถานะเคส)
+POST /line/webhook          LINE Messaging API ตอบผ่าน Reply API
+POST /cases/{case_id}/close เจ้าหน้าที่หลังบ้านปิดเคส (ต้องใช้ admin token) — Agent 1 ไม่ปิดเคสเอง
 GET  /health
 
-Runtime v1.3: PostgreSQL when DATABASE_URL is configured; SQLite for local runs.
-LINE replies record delivery only after success. HTTP handoff is a draft transport,
-enabled only with AGENT2_HANDOFF_URL/TOKEN. No LINE push is performed.
+Pipeline ไม่เรียก API นี้ แต่อ่าน Confirmed Version จาก View pipeline_confirmed_cases ใน PostgreSQL โดยตรง
+Background job ส่งข้อความเตือน Draft 1 ครั้งผ่าน LINE Push เมื่อผู้ใช้เงียบครบ 30 นาที
 """
 
+import hmac
 import json
 import logging
 import os
 import threading
-import hmac
-from datetime import datetime
-from fastapi import Header, Request, Depends
-from .repository import Repository
-from .handoff import HandoffDispatcher, http_sender
-from .knowledge import KnowledgeBase
-from .areas import AreaResolver
-from .area_summary import publish_summaries
-from .schemas import OperationalStatusRecord, CasePriority, ContactAccessLog, now_bkk
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import dspy
+import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, model_validator
 
-from app.agent import FloodAgent
-from app.schemas import AgentTurnOutput, Hotline
+from .agent import Agent1
+from .knowledge import KnowledgeBase
+from .response import ResponseGenerator
+from .schemas import TurnOutput
+from .store import Store
 
 load_dotenv()
 log = logging.getLogger("agent1")
 
 APP_DIR = Path(__file__).resolve().parent
-HOTLINES_PATH = APP_DIR / "hotlines_th.json"
 DEFAULT_MODEL = "gemini/gemini-3.1-flash-lite"
+LINE_API = "https://api.line.me/v2/bot/message"
 
 
 class LocationPayload(BaseModel):
@@ -48,12 +46,12 @@ class LocationPayload(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    """ส่งอย่างใดอย่างหนึ่ง: input_text (ข้อความ), location (แชร์ตำแหน่ง) หรือ postback (กดปุ่ม Quick Reply)"""
+    """ส่งอย่างใดอย่างหนึ่ง: input_text, location หรือ postback (data ของปุ่ม เช่น consent=yes)"""
 
-    user_id: str = Field(min_length=1, description="รหัสผู้ใช้ภายใน 1 คน = 1 บทสนทนา (ห้ามใช้ LINE User ID ตรง ๆ ในระบบจริง)")
+    user_id: str = Field(min_length=1, description="reporter_ref ห้ามใช้ LINE User ID ตรง ๆ")
     input_text: str | None = Field(default=None, min_length=1)
     location: LocationPayload | None = None
-    postback: str | None = Field(default=None, min_length=1, description="data ของปุ่ม เช่น location_consent=yes")
+    postback: str | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def _exactly_one(self) -> "ChatRequest":
@@ -66,80 +64,72 @@ class ChatRequest(BaseModel):
             return {"location": (self.location.latitude, self.location.longitude)}
         if self.postback is not None:
             return {"postback": self.postback}
-        return {"input_text": self.input_text}
+        return {"text": self.input_text}
 
 
-class ResetRequest(BaseModel):
-    user_id: str = Field(min_length=1)
+class CloseRequest(BaseModel):
+    actor: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
 
 
 def configure_dspy() -> str:
-    if dspy.settings.lm is not None:  # ตั้งไว้แล้ว เช่น ตอนทดสอบด้วย DummyLM
+    if dspy.settings.lm is not None:  # ตั้งไว้แล้ว เช่น ตอนทดสอบ
         return getattr(dspy.settings.lm, "model", "configured")
-    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key:
-        raise RuntimeError("Missing Gemini API key. Set GEMINI_API_KEY, GOOGLE_API_KEY, or API_KEY.")
-
+        raise RuntimeError("Missing Gemini API key. Set GEMINI_API_KEY or GOOGLE_API_KEY.")
     model = os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
-    lm = dspy.LM(model=model, api_key=api_key)
-    dspy.configure(lm=lm)
+    dspy.configure(lm=dspy.LM(model=model, api_key=api_key))
     return model
 
 
-def load_hotlines(path: Path = HOTLINES_PATH) -> list[Hotline]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if data.get("status") != "verified":
-        log.warning("hotlines_th.json ยังไม่ได้ตรวจกับแหล่งทางการ (status=%s)", data.get("status"))
-    return [Hotline.model_validate(h) for h in data["hotlines"]]
+def push_line(line_user_id: str, output: TurnOutput) -> None:
+    from .line_adapter import build_messages
+    token = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
+    httpx.post(f"{LINE_API}/push", headers={"Authorization": "Bearer " + token},
+               json={"to": line_user_id, "messages": build_messages(output)}, timeout=10).raise_for_status()
+
+
+def send_reminders(agent: Agent1, store: Store) -> None:
+    for user_ref, case_id, text in agent.due_reminders():
+        line_user_id = store.line_id(user_ref)
+        if line_user_id and os.getenv("LINE_CHANNEL_ACCESS_TOKEN"):
+            push_line(line_user_id, TurnOutput(output_text=text, case_id=case_id))
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.model = configure_dspy()
-    app.state.hotlines = load_hotlines()
-    app.state.repository = Repository(os.getenv("DATABASE_URL", "sqlite:///agent1.sqlite3"))
-    app.state.sender = http_sender(os.environ["AGENT2_HANDOFF_URL"], os.environ["AGENT2_HANDOFF_TOKEN"]) if os.getenv("AGENT2_HANDOFF_URL") else None
-    app.state.knowledge = KnowledgeBase(os.getenv("KNOWLEDGE_PATH", str(APP_DIR / "knowledge_th.csv")), threshold=float(os.getenv("RAG_THRESHOLD", "0.12")))
-    app.state.areas = AreaResolver(os.getenv("AREAS_PATH", str(APP_DIR / "areas_singburi.csv")))
-    app.state.agents = {}  # user_id → FloodAgent
-    app.state.locks = {}  # user_id → Lock (ข้อความของผู้ใช้คนเดียวกันต้องทำทีละข้อความ)
-    app.state.registry_lock = threading.Lock()
+    app.state.store = Store(os.getenv("DATABASE_URL", "sqlite:///agent1.sqlite3"))
+    knowledge = KnowledgeBase(os.getenv("KNOWLEDGE_PATH", str(APP_DIR / "knowledge_th.csv")),
+                              threshold=float(os.getenv("RAG_THRESHOLD", "0.12")),
+                              allow_unreviewed=os.getenv("KB_ALLOW_UNREVIEWED") == "1")
+    if not knowledge.docs:
+        log.warning("Knowledge Base ว่าง: ยังไม่มีเอกสารที่ผ่านผู้ตรวจ (ตั้ง KB_ALLOW_UNREVIEWED=1 เฉพาะตอนพัฒนา)")
+    app.state.agent = Agent1(app.state.store, knowledge,
+                             generator=ResponseGenerator(use_llm=os.getenv("ENABLE_RESPONSE_GENERATOR", "1") != "0"))
+    app.state.lock = threading.Lock()  # ประมวลผลทีละข้อความ เพื่อไม่ให้ Case State ชนกัน
     stop = threading.Event()
+
     def background():
-        while not stop.wait(30):
+        while not stop.wait(60):
             try:
-                for user_id, _ in app.state.repository.all_snapshots():
-                    if user_id == "__area_summaries__":
-                        continue
-                    agent, lock = get_agent(user_id)
-                    with lock:
-                        ttl = os.getenv("CONTACT_PENDING_TTL_HOURS")
-                        agent.maintain(contact_pending_ttl_hours=float(ttl) if ttl else None)
-                publish_summaries(app.state.repository)
-                HandoffDispatcher(app.state.repository, app.state.sender).dispatch()
+                with app.state.lock:
+                    send_reminders(app.state.agent, app.state.store)
             except Exception as exc:
-                log.error("maintenance failed: %s", type(exc).__name__)
+                log.error("reminder job failed: %s", type(exc).__name__)
+
     worker = threading.Thread(target=background, daemon=True)
     worker.start()
     try:
         yield
     finally:
         stop.set()
-        worker.join(timeout=35)
-        app.state.repository.close()
+        worker.join(timeout=65)
+        app.state.store.close()
 
 
 app = FastAPI(title="DSI490 Flood Agent 1 API", lifespan=lifespan)
-
-
-def get_agent(user_id: str) -> tuple[FloodAgent, threading.Lock]:
-    with app.state.registry_lock:
-        if user_id not in app.state.agents:
-            app.state.agents[user_id] = FloodAgent(hotlines=app.state.hotlines, internal_user_id=user_id,
-                repository=app.state.repository, sender=app.state.sender, knowledge=app.state.knowledge, area_resolver=app.state.areas,
-                composer=False if os.getenv("ENABLE_RESPONSE_COMPOSER", "1") == "0" else None)
-            app.state.locks[user_id] = threading.Lock()
-        return app.state.agents[user_id], app.state.locks[user_id]
 
 
 @app.get("/health")
@@ -147,41 +137,21 @@ def health() -> dict[str, str]:
     return {"status": "ok", "model": app.state.model}
 
 
-@app.post("/chat", response_model=AgentTurnOutput)
-def chat(payload: ChatRequest) -> AgentTurnOutput:
-    agent, lock = get_agent(payload.user_id)
-    with lock:
+@app.post("/chat", response_model=TurnOutput)
+def chat(payload: ChatRequest) -> TurnOutput:
+    with app.state.lock:
         try:
-            return agent(**payload.agent_kwargs())
+            return app.state.agent.handle(payload.user_id, **payload.agent_kwargs())
         except Exception as exc:
-            # ไม่ใส่ข้อความผู้ใช้ใน log/response เพราะอาจมีข้อมูลส่วนบุคคล
+            # ไม่ใส่ข้อความผู้ใช้ใน log เพราะอาจมีข้อมูลส่วนบุคคล
             log.error("chat failed: %s", type(exc).__name__)
             raise HTTPException(status_code=502, detail=f"Agent failed: {type(exc).__name__}") from exc
 
 
-@app.post("/chat/reset")
-def reset(payload: ResetRequest) -> dict[str, str]:
-    agent, lock = get_agent(payload.user_id)
-    with lock:
-        agent.reset()
-    return {"status": "reset", "user_id": payload.user_id}
-
-
-class AdminChange(BaseModel):
-    user_id: str
-    incident_id: str
-    actor: str = Field(min_length=1)
-    reason: str = Field(min_length=1)
-
-
-class OperationChange(AdminChange):
-    status: str
-    source: str
-    recorded_at: datetime
-
-
-class PriorityChange(AdminChange):
-    priority: CasePriority
+@app.get("/dev/chat", include_in_schema=False)
+def dev_chat() -> FileResponse:
+    """หน้าแชตจำลอง LINE สำหรับทดสอบ เรียก POST /chat เหมือนกัน"""
+    return FileResponse(APP_DIR / "static" / "chat.html")
 
 
 def require_admin(authorization: str | None = Header(default=None)):
@@ -192,72 +162,41 @@ def require_admin(authorization: str | None = Header(default=None)):
         raise HTTPException(status_code=403, detail="Forbidden")
 
 
-@app.post("/incidents/operation", dependencies=[Depends(require_admin)])
-def update_operation(payload: OperationChange):
-    agent, lock = get_agent(payload.user_id)
-    with lock:
-        st = agent.incidents.get(payload.incident_id)
-        if st is None:
-            raise HTTPException(status_code=404, detail="Unknown incident")
-        try:
-            record = OperationalStatusRecord(status=payload.status, source=payload.source, recorded_by=payload.actor,
-                                              reason=payload.reason, recorded_at=payload.recorded_at)
-            active = agent.active_id
-            agent.active_id = st.incident_id
-            agent.record_operation(record)
-            agent.active_id = active
-            agent.persist()
-        except ValueError:
-            raise HTTPException(status_code=422, detail="Invalid or stale operation")
-        finally:
-            if "active" in locals():
-                agent.active_id = active
-                agent.persist()
-        app.state.repository.audit({"action":"operation", "actor":payload.actor, "incident_id":st.incident_id,
-                                    "reason":payload.reason, "at":now_bkk().isoformat()})
-        return {"recorded":True}
+@app.get("/dev/database", dependencies=[Depends(require_admin)], include_in_schema=False)
+def dev_database(user_id: str):
+    """อ่านแถวที่บันทึกจริง เฉพาะผู้ใช้ที่เลือก สำหรับผู้ดูแลหน้าทดสอบ"""
+    with app.state.lock:
+        store = app.state.store
+        tables = {}
+        with store.transaction() as c:
+            queries = {
+                "users": ("SELECT * FROM users WHERE user_ref=?", (user_id,)),
+                "cases": ("SELECT * FROM cases WHERE user_ref=?", (user_id,)),
+                "case_raw_messages": ("SELECT * FROM case_raw_messages WHERE user_ref=? ORDER BY created_at", (user_id,)),
+            }
+            for name in ("case_personal_data", "case_drafts", "case_slots", "case_versions",
+                         "case_version_contacts", "case_events", "pipeline_confirmed_cases", "pipeline_case_contacts"):
+                queries[name] = (f"SELECT * FROM {name} WHERE case_id IN (SELECT case_id FROM cases WHERE user_ref=?)", (user_id,))
+            for name, (sql, args) in queries.items():
+                cursor = store._exec(c, sql, args)
+                columns = [column[0] for column in cursor.description]
+                tables[name] = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        return {"database": "PostgreSQL" if store.postgres else "SQLite", "user_id": user_id, "tables": tables}
 
 
-@app.post("/incidents/priority", dependencies=[Depends(require_admin)])
-def update_priority(payload: PriorityChange):
-    agent, lock = get_agent(payload.user_id)
-    with lock:
-        if payload.incident_id not in agent.incidents:
-            raise HTTPException(status_code=404, detail="Unknown incident")
-        if payload.priority.adjusted_by != payload.actor or payload.priority.source == "agent1_rules":
-            raise HTTPException(status_code=422, detail="Manual source and matching actor required")
-        active = agent.active_id
-        try:
-            agent.active_id = payload.incident_id
-            agent.override_priority(payload.priority)
-        except ValueError:
-            raise HTTPException(status_code=422, detail="Invalid or stale priority")
-        finally:
-            agent.active_id = active
-            agent.persist()
-        app.state.repository.audit({"action":"priority", "actor":payload.actor, "incident_id":payload.incident_id,
-                                    "reason":payload.reason, "at":now_bkk().isoformat()})
-        return {"recorded":True}
-
-
-@app.get("/contacts/{contact_ref}", dependencies=[Depends(require_admin)])
-def read_contact(contact_ref: str, user_id: str, actor: str, reason: str):
-    if not actor.strip() or not reason.strip():
-        raise HTTPException(status_code=422, detail="Actor and reason required")
-    agent, lock = get_agent(user_id)
-    with lock:
-        contact = next((c for c in agent.contacts if c.contact_ref == contact_ref and not c.deleted_at), None)
-        if contact is None:
-            raise HTTPException(status_code=404, detail="Unknown contact")
-        audit = ContactAccessLog(contact_ref=contact_ref, accessed_by=actor, accessed_at=now_bkk(), reason=reason)
-        app.state.repository.audit(audit.model_dump(mode="json"))
-        return {"phone":contact.phone, "name":contact.name}
+@app.post("/cases/{case_id}/close", dependencies=[Depends(require_admin)])
+def close_case(case_id: str, payload: CloseRequest):
+    with app.state.lock:
+        if not app.state.agent.close_case(case_id, actor=payload.actor, reason=payload.reason):
+            raise HTTPException(status_code=404, detail="Unknown or already closed case")
+    return {"closed": True}
 
 
 @app.post("/line/webhook")
 async def line_webhook(request: Request, x_line_signature: str | None = Header(default=None)):
-    from .line_adapter import verify_signature, parse_webhook, build_messages
-    import httpx
+    from starlette.concurrency import run_in_threadpool
+
+    from .line_adapter import build_messages, parse_webhook, verify_signature
     body = await request.body()
     secret, salt, token = (os.getenv(k) for k in ("LINE_CHANNEL_SECRET", "LINE_USER_HMAC_SECRET", "LINE_CHANNEL_ACCESS_TOKEN"))
     if not all((secret, salt, token)):
@@ -268,39 +207,31 @@ async def line_webhook(request: Request, x_line_signature: str | None = Header(d
         events = parse_webhook(json.loads(body), salt=salt)
     except (ValueError, KeyError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid webhook")
-    # Synchronous model work runs outside the event loop.
-    from starlette.concurrency import run_in_threadpool
+
     def handle():
+        store, agent = app.state.store, app.state.agent
         for event in events:
-            if not event.event_id:
+            if not event.event_id or event.kind in {"follow", "unfollow"} or not event.reply_token:
                 continue
-            agent, lock = get_agent(event.user_id)
-            with lock:
-                if event.kind in {"follow", "unfollow"}:
-                    agent.user_active = event.kind == "follow"
-                    agent.persist()
-                    app.state.repository.record_receipt(event.event_id, event.user_id, {"delivered":True})
-                    continue
-                if not event.reply_token:
-                    continue
-                cached = app.state.repository.receipt(event.event_id, event.user_id)
+            with app.state.lock:
+                cached = store.receipt(event.event_id)
                 if cached and cached.get("delivered"):
                     continue
+                store.set_line_id(event.user_id, event.line_user_id)
                 if cached:
-                    output = AgentTurnOutput.model_validate(cached["output"])
+                    output = TurnOutput.model_validate(cached["output"])
                 elif event.kind == "unsupported":
-                    output = AgentTurnOutput(output_text=agent.templates["unsupported_message"], intents=[],
-                                             incident_id=None, incident_status=None, next_actions=["none"])
+                    output = TurnOutput(output_text=agent.t["unsupported_message"])
                 else:
-                    output = agent(**event.agent_kwargs(), defer_delivery=True)
-                app.state.repository.record_receipt(event.event_id, event.user_id, {"output":output.model_dump(mode="json"), "delivered":False})
-                try:
-                    response = httpx.post("https://api.line.me/v2/bot/message/reply", headers={"Authorization":"Bearer " + token},
-                                          json={"replyToken":event.reply_token, "messages":build_messages(output)}, timeout=10)
-                    response.raise_for_status()
-                except httpx.HTTPError:
-                    raise HTTPException(status_code=502, detail="LINE reply failed")
-                agent.confirm_delivery()
-                app.state.repository.record_receipt(event.event_id, event.user_id, {"output":output.model_dump(mode="json"), "delivered":True})
+                    output = agent.handle(event.user_id, **event.agent_kwargs())
+                store.record_receipt(event.event_id, {"output": output.model_dump(mode="json"), "delivered": False})
+            try:
+                httpx.post(f"{LINE_API}/reply", headers={"Authorization": "Bearer " + token},
+                           json={"replyToken": event.reply_token, "messages": build_messages(output)},
+                           timeout=10).raise_for_status()
+            except httpx.HTTPError:
+                raise HTTPException(status_code=502, detail="LINE reply failed")
+            store.record_receipt(event.event_id, {"output": output.model_dump(mode="json"), "delivered": True})
+
     await run_in_threadpool(handle)
-    return {"ok":True}
+    return {"ok": True}

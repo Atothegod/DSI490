@@ -1,90 +1,100 @@
-"""Small CSV retrieval for MVP. Approval and expiration are enforced before search."""
+"""
+Knowledge Retriever (หัวข้อ 4) — Static Knowledge Base + Dynamic Retrieval
+
+- เอกสารทุกชิ้นมี kb_doc_id, แหล่งที่มา, ผู้ตรวจ, วันที่ตรวจ
+- status = mock_unreviewed ใช้ได้เฉพาะตอนพัฒนา (allow_unreviewed=True) ห้ามตอบประชาชนจริง
+- ค้นใหม่ทุกคำถาม คืนคะแนนความเกี่ยวข้อง ต่ำกว่า threshold = ไม่ตอบเนื้อหานั้น
+- เบอร์ฉุกเฉินเลือกด้วยโค้ดจาก Risk Facts และเจตนา (emergency_channels) ไม่ใช่ให้ LLM เลือก
+
+Retrieval Threshold ต้องกำหนดจากผลรัน kb_eval_questions ไม่ใช่ค่าที่เดา
+"""
+
+from __future__ import annotations
+
 import csv
 import re
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
-from .schemas import now_bkk
+
+from .schemas import MessageIntent, RiskFacts
+
+KB_VERSION = "mock-0.0"
+APPROVED = "approved"
 
 
 @dataclass(frozen=True)
-class Evidence:
-    chunk_id: str
+class KBDoc:
+    kb_doc_id: str
+    category: str
     title: str
-    reviewed_text: str
-    url: str
+    text: str
     source_org: str
+    url: str
+    status: str
+    reviewed_by: str
+    reviewed_at: str
+    example_questions: str
+    triggers: str
+    hotline: str
 
 
-def terms(text):
+@dataclass(frozen=True)
+class Hit:
+    doc: KBDoc
+    score: float
+
+
+def _grams(text: str) -> set[str]:
     text = re.sub(r"\s+", "", text.lower())
-    return {text[i:i+3] for i in range(max(0, len(text)-2))}
+    return {text[i:i + 3] for i in range(max(0, len(text) - 2))}
 
 
 class KnowledgeBase:
-    def __init__(self, path=None, *, threshold=0.12):
+    def __init__(self, path: str | Path | None = None, *, threshold: float = 0.12, allow_unreviewed: bool = False,
+                 kb_version: str = KB_VERSION):
         self.threshold = threshold
-        self.rows = []
+        self.kb_version = kb_version
+        self.docs: list[KBDoc] = []
         if path and Path(path).exists():
             with Path(path).open(encoding="utf-8-sig", newline="") as f:
-                self.rows = list(csv.DictReader(f))
+                for row in csv.DictReader(f):
+                    doc = KBDoc(**{k: row.get(k, "") or "" for k in KBDoc.__dataclass_fields__})
+                    reviewed = doc.status == APPROVED and doc.reviewed_by and doc.reviewed_at
+                    if reviewed or (allow_unreviewed and doc.status == "mock_unreviewed"):
+                        self.docs.append(doc)
+        self.by_id = {d.kb_doc_id: d for d in self.docs}
 
-    def _eligible(self, row, now):
-        if row.get("review_status") != "approved" or row.get("category") not in {"A", "B"}:
-            return False
-        if not all(row.get(k) for k in ("chunk_id", "source_org", "title", "url", "reviewed_text", "reviewed_by", "reviewed_at", "verified_at")):
-            return False
-        try:
-            for key in ("verified_at", "reviewed_at"):
-                value = datetime.fromisoformat(row[key])
-                if value.tzinfo is None or value > now:
-                    return False
-            expiry = datetime.fromisoformat(row["valid_until"]) if row.get("valid_until") else None
-            if row["category"] == "B" and not expiry:
-                return False
-            if expiry and (expiry.tzinfo is None or expiry <= now):
-                return False
-        except ValueError:
-            return False
-        return True
-
-    @staticmethod
-    def _evidence(row):
-        return Evidence(**{key: row[key] for key in Evidence.__dataclass_fields__})
-
-    def search(self, query, *, now=None, limit=3):
-        now = now or now_bkk()
-        q, hits = terms(query), []
-        for row in self.rows:
-            if not self._eligible(row, now):
-                continue
-            t = terms(" ".join(row.get(k, "") for k in ("title", "example_questions", "reviewed_text")))
-            score = len(q & t) / max(1, len(q))
-            if score >= self.threshold:
-                hits.append((score, self._evidence(row)))
-        return [e for _, e in sorted(hits, key=lambda pair: pair[0], reverse=True)[:limit]]
-
-    def core_snippets(self, query=None, *, now=None, limit=3):
-        """Curated approved safety facts, available without a retrieval score (4.4).
-
-        Query filtering uses explicit reviewed triggers; these snippets are evidence,
-        not a reason to broadcast safety instructions on every urgent message.
-        Approval, reviewer metadata and expiry are still required.
-        """
-        now = now or now_bkk()
+    def search(self, query: str, *, limit: int = 3, include_emergency: bool = True) -> list[Hit]:
+        q = _grams(query)
         hits = []
-        for row in self.rows:
-            if row.get("is_core_safety", "").strip().lower() != "true" or row.get("category") != "A":
+        for doc in self.docs:
+            if doc.category == "emergency" and not include_emergency:
                 continue
-            if not self._eligible(row, now):
-                continue
-            triggers = [part.strip() for part in row.get("core_triggers", "").split(";") if part.strip()]
-            if query is not None and not any(trigger in query for trigger in triggers):
-                continue
-            hits.append(self._evidence(row))
-        return hits[:limit]
+            triggers = [t for t in doc.triggers.split(";") if t.strip()]
+            if any(t in query for t in triggers):
+                score = 1.0
+            else:
+                score = len(q & _grams(" ".join((doc.title, doc.example_questions, doc.text)))) / max(1, len(q))
+            if score >= self.threshold:
+                hits.append(Hit(doc, score))
+        return sorted(hits, key=lambda h: h.score, reverse=True)[:limit]
 
-    def evidence_for(self, query, *, now=None, limit=3):
-        # Prioritize relevant curated safety evidence and deduplicate ordinary hits.
-        evidence = self.core_snippets(query, now=now, limit=limit) + self.search(query, now=now, limit=limit)
-        return list({item.chunk_id:item for item in evidence}.values())[:limit]
+    def hotline(self, number: str) -> KBDoc | None:
+        return next((d for d in self.docs if d.hotline == number), None)
+
+    def emergency_channels(self, facts: RiskFacts, intents: list[MessageIntent], *, flood_related: bool = True) -> list[KBDoc]:
+        """โค้ดเลือกเบอร์ตามตารางช่องทางฉุกเฉิน แสดงเฉพาะที่ตรงสถานการณ์"""
+        numbers = []
+        if facts.life_threat == "true":
+            numbers.append("1669")
+        if flood_related and (facts.life_threat == "true" or "true" in (facts.trapped, facts.unsafe_to_evacuate, facts.water_rising)):
+            numbers.append("1784")
+        if MessageIntent.POLICE in intents:
+            numbers.append("191")
+        if MessageIntent.EMOTIONAL in intents:
+            numbers.append("1323")
+        return [doc for n in numbers if (doc := self.hotline(n))]
+
+    def fallback_channels(self) -> list[KBDoc]:
+        """ค้นไม่พบข้อมูลที่เชื่อถือได้ → แนะนำช่องทางทางการที่อยู่ใน Knowledge Base"""
+        return [doc for doc in (self.hotline("1784"),) if doc]

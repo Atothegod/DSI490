@@ -4,8 +4,8 @@ line_adapter.py — แปลงข้อมูลระหว่าง LINE Mes
 ไฟล์นี้ไม่เรียก network เลย มีแค่
 - verify_signature  ตรวจว่า webhook มาจาก LINE จริง (header x-line-signature)
 - parse_webhook     แปลง webhook body → รายการ LineInput (ข้อความ / ตำแหน่ง / กดปุ่ม)
-- internal_user_id  แปลง LINE User ID เป็นรหัสภายใน (ห้ามเก็บหรือส่ง LINE User ID ตรง ๆ — R07)
-- build_messages    แปลง AgentTurnOutput → messages สำหรับ Reply API พร้อมปุ่ม Quick Reply
+- internal_user_id  แปลง LINE User ID เป็น reporter_ref (LINE User ID จริงเก็บแยกใน user_line_ids เพื่อส่งข้อความเตือนเท่านั้น)
+- build_messages    แปลง TurnOutput → messages สำหรับ Reply/Push API พร้อมปุ่ม Quick Reply
 
 main.py supplies the verified webhook and Reply API transport. This module remains pure.
 """
@@ -18,7 +18,7 @@ import hmac
 from dataclasses import dataclass
 from typing import Literal
 
-from .schemas import AgentTurnOutput
+from .schemas import TurnOutput
 
 TEXT_LIMIT = 5000  # LINE text message ยาวได้ไม่เกิน 5,000 ตัวอักษร
 MAX_MESSAGES = 5  # Reply API ส่งได้ครั้งละไม่เกิน 5 messages
@@ -42,19 +42,19 @@ def internal_user_id(line_user_id: str, salt: str) -> str:
 
 @dataclass(frozen=True)
 class LineInput:
-    user_id: str  # รหัสภายในแล้ว ไม่ใช่ LINE User ID
+    user_id: str  # reporter_ref ไม่ใช่ LINE User ID
+    line_user_id: str
     kind: Literal["text", "location", "postback", "unsupported", "follow", "unfollow"]
     reply_token: str | None
     event_id: str | None  # webhookEventId ใช้กัน event ซ้ำ (R05)
-    is_redelivery: bool = False
     text: str | None = None
     location: tuple[float, float] | None = None  # address ที่ LINE ส่งมาไม่เก็บ
     postback: str | None = None
 
     def agent_kwargs(self) -> dict:
-        """ใช้เรียก agent(**line_input.agent_kwargs())"""
+        """ใช้เรียก agent.handle(user_id, **line_input.agent_kwargs())"""
         if self.kind == "text":
-            return {"input_text": self.text}
+            return {"text": self.text}
         if self.kind == "location":
             return {"location": self.location}
         if self.kind == "postback":
@@ -74,9 +74,9 @@ def parse_webhook(body: dict, *, salt: str) -> list[LineInput]:
             continue
         common = dict(
             user_id=internal_user_id(src["userId"], salt),
+            line_user_id=src["userId"],
             reply_token=ev.get("replyToken"),
             event_id=ev.get("webhookEventId"),
-            is_redelivery=bool(ev.get("deliveryContext", {}).get("isRedelivery", False)),
         )
         if ev.get("type") == "postback":
             out.append(LineInput(kind="postback", postback=ev.get("postback", {}).get("data", ""), **common))
@@ -105,8 +105,8 @@ def _split_text(text: str) -> list[str]:
     return [p for p in parts if p][:MAX_MESSAGES]
 
 
-def build_messages(output: AgentTurnOutput) -> list[dict]:
-    """messages สำหรับ POST /v2/bot/message/reply — Quick Reply ติดกับข้อความสุดท้าย"""
+def build_messages(output: TurnOutput) -> list[dict]:
+    """messages สำหรับ Reply/Push API — Quick Reply ติดกับข้อความสุดท้าย"""
     messages = [{"type": "text", "text": t} for t in _split_text(output.output_text)]
     if output.quick_replies and messages:
         items = []

@@ -1,144 +1,139 @@
 """
-extraction.py — จุดเรียก Gemini จุดที่ 1: ดึงส่วนที่เปลี่ยน (delta) จากข้อความล่าสุด
+Information Extractor + Intent Classifier (หัวข้อ 8) — DSPy Signature เดียว
 
-ย้ายมาจาก flood_agent.ipynb ส่วน C (prompt ของทีม) + กฎที่เพิ่มในส่วน E
-ตั้งแต่นี้ให้แก้ prompt ที่ไฟล์นี้ที่เดียว เพื่อให้ Notebook และ API ใช้ prompt เดียวกัน
-
-ข้อความที่ส่งเข้ามาต้องปิดบังเบอร์แล้ว (safety.redact_phones) — Gemini ต้องไม่เห็นเบอร์โทร
+Input ต้องผ่าน Privacy Filter แล้วเสมอ (privacy.filter_text) Gemini ไม่เห็นชื่อ เบอร์ ที่อยู่ หรือพิกัด
+ผลลัพธ์ตรวจด้วย Pydantic แล้วผ่าน ground() ซึ่งตัดทุกค่าที่ไม่มีหลักฐานในข้อความจริงทิ้ง
 """
 
 from __future__ import annotations
 
-from typing import Iterable
+import json
+import re
 
 import dspy
 
-from .schemas import (
-    ExtractionResult,
-    IncidentFieldName,
-    IncidentState,
-    Intent,
-    Need,
-    SituationTag,
-    VulnerableType,
-    WaterDescriptor,
-)
+from .schemas import AFFECTED_GROUPS, RISK_FACTS, Extraction, IncidentData, MessageIntent
+
+INSTRUCTIONS = """สกัดข้อมูลเหตุน้ำท่วมจากข้อความล่าสุดของผู้ใช้เท่านั้น ห้ามเติมข้อมูลที่ข้อความไม่ได้บอก
+ข้อความผ่านการปิดบังข้อมูลส่วนบุคคลแล้ว ([PHONE] [NAME] [ADDRESS]) ห้ามเดาค่าที่ถูกปิดบัง
+
+intents (เลือกได้หลายค่า): incident = แจ้งเหตุหรือให้ข้อมูลเหตุ, question = ถามคำถามหรือขอคำแนะนำ,
+emotional = แสดงความรู้สึก เช่น กลัว เครียด เสียใจ, police = แจ้งเหตุร้ายที่ต้องใช้ตำรวจ
+
+case_intent: same_case = ข้อมูลของเคสที่กำลังคุย, new_case = แจ้งเหตุอีกบ้านหรือแจ้งแทนคนอื่นที่อยู่คนละที่,
+relocate = ผู้ประสบภัยย้ายไปอยู่จุดอื่น, unclear = ไม่แน่ใจว่าหมายถึงเคสไหน
+
+problem / needs: ข้อความสั้นภาษาไทยจากสิ่งที่ผู้ใช้บอก ถ้า draft มีอยู่แล้วและข้อความใหม่เพิ่มรายละเอียด
+ให้ส่งข้อความที่รวมของเดิมกับของใหม่ ถ้าข้อความใหม่ไม่กล่าวถึงให้เป็น null
+*_evidence: ข้อความต้นฉบับที่ยกมาตรงตัวจาก latest_message
+needs_answer: "none" เมื่อผู้ใช้บอกว่าไม่ต้องการความช่วยเหลือ, "unknown" เมื่อบอกว่ายังไม่รู้ นอกนั้น null
+
+affected_people: นับเฉพาะจำนวนที่ผู้ใช้บอกเป็นตัวเลขหรือคำบอกจำนวนชัดเจน ห้ามใช้ 0 กลุ่มที่ไม่ได้บอกเป็น null
+children เด็ก, elderly ผู้สูงอายุ, disabled ผู้พิการ/ติดเตียง, pregnant_women หญิงตั้งครรภ์,
+other ผู้ประสบภัยที่ไม่อยู่ใน 4 กลุ่ม เช่น "มีแค่ผมคนเดียว" = other 1
+affected_people_evidence: {ชื่อกลุ่ม: ข้อความต้นฉบับ}
+count_unclear: true เมื่อจำนวนกำกวม เช่น "หลายคน" หรือ "แม่ที่แก่แล้ว 2 คน" (ไม่ชัดว่ารวมผู้แจ้งหรือไม่) แล้วอย่าเติมจำนวน
+
+risk_facts: ค่า "true" / "false" / "unknown" ต้องมีข้อความที่ผู้ใช้พิมพ์จริงรองรับใน risk_fact_evidence
+ห้ามอนุมานจากชื่อยา อายุ หรือกลุ่มของผู้ประสบภัย ไม่มีหลักฐาน = "unknown"
+life_threat อาการคุกคามชีวิตตอนนี้ เช่น จมน้ำ หมดสติ หายใจลำบากรุนแรง บาดเจ็บสาหัส
+trapped ออกจากที่อยู่ไม่ได้, water_rising ระดับน้ำกำลังสูงขึ้น,
+unsafe_to_evacuate น้ำสูงตั้งแต่ระดับเอวขึ้นไปหรือกระแสน้ำแรง, cannot_self_evacuate มีคนติดเตียงหรือเดินไม่ได้,
+in_safe_place ทุกคนอยู่ในจุดที่น้ำไม่ถึงตอนนี้, basic_needs_unmet ขาดอาหาร น้ำดื่ม ยา หรือสิ่งจำเป็น,
+essential_medication_risk ผู้แจ้งบอกเองว่ายาหรืออุปกรณ์ที่ขาดนั้นขาดไม่ได้หรือจะเกิดอันตรายร้ายแรง
+danger_signals: วลีสั้นจากข้อความที่บอกอันตราย
+question: คำถามของผู้ใช้ (ถ้ามี) เขียนใหม่ให้ค้นหาได้ ไม่ใส่ข้อมูลส่วนบุคคล"""
 
 
-def _vals(e) -> str:
-    return ", ".join(x.value for x in e)
+class ExtractIncident(dspy.Signature):
+    __doc__ = INSTRUCTIONS
+
+    latest_message: str = dspy.InputField(desc="ข้อความล่าสุดที่ผ่าน Privacy Filter แล้ว")
+    draft: str = dspy.InputField(desc="Incident Data ปัจจุบัน (JSON)")
+    pending_question: str = dspy.InputField(desc="Slot ที่ระบบกำลังถามค้าง หรือ none")
+    conversation_summary: str = dspy.InputField(desc="สรุปบทสนทนาที่ไม่มีข้อมูลส่วนบุคคล")
+    result: Extraction = dspy.OutputField()
 
 
-# ---- prompt ของทีม (ส่วน C) ------------------------------------------------
-EXTRACT_INSTRUCTIONS = f"""ดึงข้อมูลเหตุการณ์น้ำท่วมจากข้อความล่าสุดของประชาชนเท่านั้น
-บันทึกเฉพาะข้อมูลที่ระบุไว้อย่างชัดเจน ห้ามเพิ่มข้อเท็จจริงหรือสรุปสถานการณ์ที่ข้อความไม่ได้ยืนยัน
-ตัวอย่าง: หากข้อความระบุว่า "มีผู้สูงอายุ" ให้บันทึกเพียงว่ามีผู้สูงอายุ ห้ามระบุว่าผู้สูงอายุติดค้าง เว้นแต่ข้อความจะยืนยันว่าติดค้าง
-
-intents (เลือกได้หลายค่า): {_vals(Intent)}
-
-target:
-- active_incident: ข้อความเกี่ยวกับเหตุที่กำลังคุยอยู่
-- new_incident: แจ้งเหตุใหม่ หรือยังไม่มีเหตุที่กำลังคุย
-- unclear: กล่าวถึงตำแหน่งที่ต่างจากเหตุที่กำลังคุย หรือไม่แน่ใจว่าเป็นเหตุไหน
-- none: ไม่เกี่ยวกับเหตุการณ์ (เช่น ถามความรู้อย่างเดียว ทักทาย)
-
-ไม่ว่า target จะเป็นอะไร ต้องดึง updates ทุก field ที่มีในข้อความ
-ห้ามละข้อมูลเพียงเพราะยังไม่รู้ว่าเป็นเหตุไหน
-
-updates: หนึ่งรายการต่อ field ที่ข้อความนี้ให้ข้อมูล รูปแบบ value ตาม field:
-- location_area: {{"name": ชื่อหมู่บ้าน ตำบล หรืออำเภอตามที่ผู้ใช้พิมพ์ เช่น "ตำบลทับยา อำเภออินทร์บุรี",
-  "level": ระดับที่ละเอียดที่สุดที่ผู้ใช้พิมพ์คำนำหน้าไว้ village (หมู่/หมู่บ้าน) tambon (ตำบล/ต.) amphoe (อำเภอ/อ.)
-  province (จังหวัด/จ.) ถ้าไม่มีคำนำหน้าใช้ unspecified ห้ามเดาระดับ}}
-  ถ้าเป็นสถานที่ เช่น ถนน วัด โรงเรียน ตลาด ให้ใส่ location_landmark แทน
-- location_landmark: ชื่อสถานที่หรือจุดสังเกต เช่น "หน้าวัดโพธิ์ชัย", "ถนนเข้าหมู่บ้าน"
-- situation: {{"text": ข้อความเต็มของผู้ใช้ ไม่ตัดทอน, "tags": [{_vals(SituationTag)}]}}
-- needs: list จาก [{_vals(Need)}] ใช้ info_only เมื่อผู้ใช้บอกว่าแค่แจ้งให้ทราบ
-- affected_people: {{"present": true/false, "count": จำนวนหรือ null, "is_approximate": true/false}}
-- vulnerable_people: {{"present": true/false, "groups": [{{"type": หนึ่งใน [{_vals(VulnerableType)}], "count": จำนวนหรือ null, "is_approximate": true/false}}]}}
-- water_level: {{"raw": ข้อความดิบ, "descriptor": หนึ่งใน [{_vals(WaterDescriptor)}] หรือ null, "cm": ตัวเลขเมื่อผู้ใช้ให้ตัวเลขเท่านั้น หรือ null}}
-  ห้ามแปลง "ถึงเอว" เป็นเซนติเมตรเอง
-
-status ของแต่ละ update:
-- known: ผู้ใช้ให้ข้อมูล (ต้องมี value)
-- unknown: ผู้ใช้บอกว่าไม่ทราบ (value = null)
-- declined: ผู้ใช้ไม่อยากบอก (value = null)
-is_correction = true เมื่อผู้ใช้แก้คำตอบเดิม เช่น "แก้เป็น", "พิมพ์ผิด" (ต่างจากสถานการณ์เปลี่ยนจริง เช่น "น้ำขึ้นเป็นเมตรแล้ว")
-
-ถ้ามี pending_question และข้อความเป็นคำตอบสั้น ๆ ให้ตีความว่าตอบ field ที่ถามค้างไว้
-
-urgent_flags: ใส่เฉพาะเมื่อผู้ใช้บอกตรง ๆ ห้ามประเมินเอง
-- people_trapped: มีคนติดอยู่ ออกไม่ได้
-- injury_reported: มีคนบาดเจ็บ ป่วยฉุกเฉิน
-- help_requested: ขอให้ช่วยด่วน เช่น "ช่วยด้วย"
-
-mentioned_location: ตำแหน่งที่ข้อความกล่าวถึง (ถ้ามี)
-question: คำถามความรู้ที่ต้องตอบ (ถ้ามี) เช่น "ต้องตัดไฟตอนไหน"
-"""
-
-# ---- กฎที่เพิ่มจากผลรันส่วน E ------------------------------------------------
-# memory.py นับเป็น correction เมื่อ Gemini บอกว่าแก้ไข AND มีคำบอกแก้ไขในช่วงประโยคเดียวกับ raw
-RAW_RULE = """
-raw ของแต่ละ update (สำคัญ): คัดลอกคำจากข้อความผู้ใช้ส่วนที่ใช้ดึงค่านั้น แบบคำต่อคำ ห้ามแต่งหรือสรุปใหม่
-ตัวอย่าง: ข้อความ "แก้เป็น 50 เซนติเมตรค่ะ พิมพ์ผิด" → water_level.raw = "50 เซนติเมตร"
-"""
-
-# needs ส่งเฉพาะเมื่อมีหลักฐาน ไม่เดา rescue จากการมีคนติดค้าง
-# (conversation.reconcile_needs เอา info_only ที่ขัดกับคำขอช่วยเหลือออกเอง)
-SITUATION_NEEDS_RULE = """
-situation: ถ้าข้อความเล่าสถานการณ์ใหม่หรือเพิ่มเติม เช่น มีคนติดค้าง น้ำขึ้นเร็ว ถนนขาด ต้องส่ง situation ทุกครั้ง แม้มี situation เดิมแล้ว
-situation.tags: ใส่เฉพาะ tag ที่ผู้ใช้พูดถึงตรง ๆ ห้ามอนุมานหรือเติม tag ใกล้เคียง
-  water_in_house = น้ำเข้าตัวบ้านของผู้แจ้ง, area_flooded = น้ำท่วมพื้นที่ส่วนรวม เช่น ถนน ซอย ทุ่งนา วัด ตลาด ทั้งหมู่บ้าน,
-  road_blocked = ถนนหรือทางใช้ไม่ได้, isolated = ติดอยู่หรือออกจากพื้นที่ไม่ได้, power_outage = ไฟดับ,
-  water_rising = น้ำกำลังสูงขึ้น, strong_current = น้ำไหลแรง, property_damage = ทรัพย์สินเสียหาย,
-  livestock_affected = สัตว์เลี้ยงหรือปศุสัตว์ได้รับผลกระทบ, electrical_hazard = ไฟรั่ว สายไฟหรืออุปกรณ์ไฟฟ้าในน้ำ,
-  structural_risk = บ้านหรือสิ่งก่อสร้างทรุด ร้าว เสี่ยงพัง
-  ตัวอย่าง: "น้ำท่วมเข้าบ้านแล้ว" → ["water_in_house"] เท่านั้น ไม่ใส่ area_flooded
-needs: ส่งเฉพาะเมื่อข้อความระบุสิ่งที่ต้องการชัดเจน เช่น "ขอเรือ" "อยากอพยพ" "ขอน้ำดื่ม" หรือ "แค่อยากแจ้งไว้"
-- ข้อความไม่ได้ระบุสิ่งที่ต้องการ → ไม่ต้องส่ง needs ห้ามเดา
-- "ช่วยด้วย" หรือการมีคนติดค้าง ยังไม่ใช่หลักฐานว่าต้องการ rescue ให้ใส่ใน urgent_flags แทน
-- ข้อความที่ขอความช่วยเหลือ ห้ามใส่ info_only
-- ใส่เฉพาะค่าที่ผู้ใช้พูดถึง หนึ่งสิ่งที่ขอ = หนึ่งค่า ห้ามเติมค่าใกล้เคียง
-  rescue = ให้คนมาช่วยพาออกหรือส่งเรือ, evacuation = อยากย้ายไปที่ปลอดภัยหรือศูนย์พักพิง,
-  medical = หมอ ยา การรักษา, food_water = อาหารและน้ำดื่ม,
-  supplies = ของใช้ที่ไม่ใช่อาหาร เช่น ผ้าห่ม ไฟฉาย ถุงทราย, other = สิ่งอื่นที่ไม่เข้าหมวด
-  ตัวอย่าง: "อยากได้น้ำดื่มกับอาหาร" → ["food_water"] เท่านั้น ไม่ใส่ supplies
-"""
-
-INSTRUCTIONS = EXTRACT_INSTRUCTIONS + RAW_RULE + SITUATION_NEEDS_RULE
-
-
-class ExtractIntentAndSlots(dspy.Signature):
-    """(instructions ถูกแทนด้วย INSTRUCTIONS)"""
-
-    history: dspy.History = dspy.InputField(desc="ข้อความล่าสุดก่อนหน้า")
-    active_incident: str = dspy.InputField(desc="IncidentState ของเหตุที่กำลังคุย เป็น JSON หรือ 'ไม่มี'")
-    pending_question: str = dspy.InputField(desc="field ที่ Agent ถามค้างไว้ หรือ 'ไม่มี'")
-    message: str = dspy.InputField(desc="ข้อความล่าสุดของประชาชน")
-    result: ExtractionResult = dspy.OutputField()
-
-
-ExtractIntentAndSlots = ExtractIntentAndSlots.with_instructions(INSTRUCTIONS)
-
-
-class Extractor(dspy.Module):
-    """Memory อยู่ใน state + pending question จึงไม่ส่งประวัติแชตเข้า Gemini"""
-
+class Extractor:
     def __init__(self):
-        super().__init__()
-        self.predict = dspy.Predict(ExtractIntentAndSlots)
-        self.context = None
+        self.predict = dspy.Predict(ExtractIncident)
 
-    def forward(
-        self,
-        message: str,
-        state: IncidentState | None = None,
-        pending: Iterable[IncidentFieldName] | None = None,
-    ) -> ExtractionResult:
-        pending = list(pending or [])
-        return self.predict(
-            history=dspy.History(messages=[]),
-            # พิกัดไม่ต้องส่ง Gemini และเบอร์ไม่อยู่ใน state อยู่แล้ว (เก็บใน ContactRecord)
-            active_incident=self.context.model_dump_json(exclude={"active_incident":{"location_coordinates"}}) if self.context else (state.model_dump_json(exclude={"location_coordinates"}) if state else "ไม่มี"),
-            pending_question=", ".join(f.value for f in pending) if pending else "ไม่มี",
-            message=message,
-        ).result
+    def __call__(self, text: str, draft: IncidentData, pending_question: str | None, summary: str) -> Extraction:
+        out = self.predict(latest_message=text, draft=json.dumps(draft.model_dump(), ensure_ascii=False),
+                           pending_question=pending_question or "none", conversation_summary=summary or "")
+        return Extraction.model_validate(out.result)
+
+
+# ---------------------------------------------------------------------------
+# ตรวจหลักฐาน — ใช้กับผลจาก LLM ทุกครั้ง
+# ---------------------------------------------------------------------------
+
+_COUNT_WORDS = ("หนึ่ง", "สอง", "สาม", "สี่", "ห้า", "หก", "เจ็ด", "แปด", "เก้า", "สิบ", "คนเดียว", "ทั้งคู่")
+# ข้อความเหล่านี้ทำให้ life_threat = true แม้ LLM พลาด (OR กับ LLM) คำที่มี "ไม่" นำหน้าไม่นับ
+LIFE_THREAT_WORDS = ("หมดสติ", "จมน้ำ", "หายใจไม่ออก", "ไม่หายใจ", "หายใจลำบาก", "เลือดออกมาก", "ไฟดูด",
+                     "บาดเจ็บสาหัส", "เจ็บท้องคลอด", "น้ำเดิน")
+NEEDS_NONE_WORDS = ("ไม่ต้องการ", "ไม่ต้องการอะไร", "ไม่มีอะไร", "ไม่มีครับ", "ไม่มีค่ะ", "ไม่มี", "ไม่ต้อง")
+NEEDS_UNKNOWN_WORDS = ("ไม่รู้", "ไม่ทราบ", "ยังไม่รู้", "ไม่แน่ใจ")
+
+
+def _in(evidence: str | None, text: str) -> bool:
+    return bool(evidence) and re.sub(r"\s+", "", evidence) in re.sub(r"\s+", "", text)
+
+
+def _count_supported(value: int, evidence: str | None, text: str) -> bool:
+    if not _in(evidence, text):
+        return False
+    digits = [int(d) for d in re.findall(r"\d+", evidence)]
+    if digits:
+        return value in digits
+    return any(w in evidence for w in _COUNT_WORDS)
+
+
+def _negated(text: str, start: int) -> bool:
+    return "ไม่" in text[max(0, start - 6):start]
+
+
+def ground(ex: Extraction, text: str) -> Extraction:
+    """ตัดทุกค่าที่หลักฐานไม่อยู่ในข้อความ (No Fabrication)"""
+    ex = ex.model_copy(deep=True)
+    if not _in(ex.problem_evidence, text):
+        ex.problem, ex.problem_evidence = None, None
+    if not _in(ex.needs_evidence, text):
+        ex.needs, ex.needs_evidence = None, None
+    for group in AFFECTED_GROUPS:
+        value = getattr(ex.affected_people, group)
+        if value is not None and not _count_supported(value, ex.affected_people_evidence.get(group), text):
+            setattr(ex.affected_people, group, None)
+            ex.affected_people_evidence.pop(group, None)
+    if ex.count_unclear:
+        ex.affected_people = type(ex.affected_people)()
+        ex.affected_people_evidence = {}
+    for fact in RISK_FACTS:
+        if getattr(ex.risk_facts, fact) != "unknown" and not _in(ex.risk_fact_evidence.get(fact), text):
+            setattr(ex.risk_facts, fact, "unknown")
+            ex.risk_fact_evidence.pop(fact, None)
+    ex.risk_fact_evidence = {k: v for k, v in ex.risk_fact_evidence.items() if getattr(ex.risk_facts, k, "unknown") != "unknown"}
+    ex.danger_signals = [s for s in ex.danger_signals if _in(s, text)]
+
+    for word in LIFE_THREAT_WORDS:
+        pos = text.find(word)
+        if pos >= 0 and not _negated(text, pos):
+            ex.risk_facts.life_threat = "true"
+            ex.risk_fact_evidence.setdefault("life_threat", word)
+            if word not in ex.danger_signals:
+                ex.danger_signals.append(word)
+            if MessageIntent.INCIDENT not in ex.intents:
+                ex.intents.append(MessageIntent.INCIDENT)
+            break
+    return ex
+
+
+def needs_answer_from_keywords(text: str) -> str | None:
+    """ใช้เมื่อระบบเพิ่งถาม needs แล้วผู้ใช้ตอบสั้น ๆ"""
+    stripped = text.strip()
+    if any(stripped.startswith(w) for w in NEEDS_UNKNOWN_WORDS):
+        return "unknown"
+    if any(stripped.startswith(w) for w in NEEDS_NONE_WORDS):
+        return "none"
+    return None

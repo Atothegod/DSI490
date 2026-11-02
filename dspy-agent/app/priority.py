@@ -1,45 +1,43 @@
-"""Draft case-level rules (Design Decisions 7.1); never decide area severity."""
-from .schemas import CasePriority, IncidentState, PriorityLevel, now_bkk
+"""
+Priority Engine — Ruleset 1.1.0 (หัวข้อ 9)
 
-RANK = {"white": 0, "green": 1, "yellow": 2, "red": 3}
+ตรวจจากบนลงล่าง กฎแรกที่เข้าเงื่อนไขคือผลลัพธ์ ไม่เรียก LLM
+unknown ไม่ถือเป็น true หรือ false — กฎดูเฉพาะค่าที่ระบุไว้
+"""
+
+from __future__ import annotations
+
+from .schemas import IncidentPriority, PriorityLevel, PriorityResult, RiskFacts, SlotStatus
+
+RULESET_VERSION = "1.1.0"
+INSUFFICIENT = "ข้อมูลไม่เพียงพอสำหรับการประเมิน"
 
 
-def evaluate_priority(state: IncidentState, *, correction=False, now=None) -> IncidentState:
-    now = now or now_bkk()
-    old = state.priority
-    if old and old.source != "agent1_rules":
-        return state  # manual overrides are authoritative
-    flags = {x.value for x in state.urgent_flag_types}
-    needs = {x.value for x in state.needs.value or []}
-    tags = {x.value for x in state.situation.value.tags} if state.situation.value else set()
-    red = sorted(flags & {"people_trapped", "injury_reported"}) + ["needs:" + n for n in sorted(needs & {"rescue", "medical"})]
-    yellow = ["needs:evacuation"] if "evacuation" in needs else []
-    yellow += sorted(tags & {"water_rising", "strong_current", "isolated", "electrical_hazard", "structural_risk"})
-    if "water_in_house" in tags and state.vulnerable_people.value:
-        yellow += ["vulnerable:" + g.type.value for g in state.vulnerable_people.value.groups
-                   if g.type.value in {"elderly", "bedridden", "disabled", "pregnant", "chronic_illness"}]
-    water = state.water_level.value
-    if water and water.descriptor and water.descriptor.value in {"chest", "neck", "above_head", "first_floor"}:
-        yellow.append("water:" + water.descriptor.value)
-    green = sorted(tags & {"water_in_house", "road_blocked", "area_flooded"})
-    green += ["needs:" + n for n in sorted(needs & {"food_water", "supplies"})]
-    if red:
-        level, reasons = PriorityLevel.RED, red
-    elif yellow:
-        level, reasons = PriorityLevel.YELLOW, yellow
-    elif flags == {"help_requested"} and not (green or needs - {"info_only"}):
-        level, reasons = PriorityLevel.REVIEW, ["help_requested_only"]
-    elif green:
-        level, reasons = PriorityLevel.GREEN, green
-    elif needs == {"info_only"}:
-        level, reasons = PriorityLevel.WHITE, ["info_only"]
-    else:
-        level, reasons = PriorityLevel.REVIEW, ["insufficient_information"]
-    if old and not correction and old.level.value in RANK:
-        if RANK.get(level.value, -1) < RANK[old.level.value]:
-            return state
-    current = CasePriority(level=level, reasons=reasons, evaluated_at=now)
-    if old and (old.level, old.reasons) == (current.level, current.reasons):
-        return state
-    return state.model_copy(update={"priority": current,
-                                    "priority_history": [*state.priority_history, *([old] if old else [])]})
+def evaluate(facts: RiskFacts, *, needs: str | None = None, needs_status: SlotStatus = SlotStatus.MISSING,
+             danger_signals: list[str] | None = None) -> PriorityResult:
+    f = facts.model_dump()
+
+    def is_(name, value="true"):
+        return f[name] == value
+
+    signals = ", ".join(danger_signals or []) or "ตามที่ผู้แจ้งรายงาน"
+    rules = (
+        ("C1", is_("life_threat"), PriorityLevel.CRITICAL, f"พบภาวะคุกคามชีวิต: {signals}"),
+        ("H1", is_("trapped") and is_("water_rising"), PriorityLevel.HIGH, "ติดอยู่ในที่พักและระดับน้ำกำลังสูงขึ้น"),
+        ("H2", is_("cannot_self_evacuate") and not is_("in_safe_place"), PriorityLevel.HIGH,
+         "มีผู้ที่อพยพเองไม่ได้และยังไม่อยู่ในจุดปลอดภัย"),
+        ("H3", is_("water_rising") and is_("in_safe_place", "false"), PriorityLevel.HIGH,
+         "ระดับน้ำกำลังสูงขึ้นและยังไม่อยู่ในจุดปลอดภัย"),
+        ("H4", is_("essential_medication_risk"), PriorityLevel.HIGH, "ขาดยาหรืออุปกรณ์การแพทย์ที่จำเป็นและมีความเสี่ยงร้ายแรง"),
+        ("H5", is_("trapped") and is_("unsafe_to_evacuate"), PriorityLevel.HIGH, "ติดอยู่ในที่พักและสภาพน้ำไม่ปลอดภัยต่อการอพยพ"),
+        ("M1", is_("basic_needs_unmet"), PriorityLevel.MEDIUM, f"ขาดสิ่งจำเป็น: {needs or 'ตามที่ผู้แจ้งรายงาน'}"),
+        ("M2", is_("trapped"), PriorityLevel.MEDIUM, "ติดอยู่ในที่พัก แต่ไม่มีรายงานความเสี่ยงเพิ่มเติม"),
+        ("L1", is_("in_safe_place") and needs_status == SlotStatus.ANSWERED_NONE, PriorityLevel.LOW,
+         "ทุกคนอยู่ในจุดปลอดภัยและไม่มีความต้องการเร่งด่วน"),
+    )
+    for rule_id, matched, level, reason in rules:
+        if matched:
+            return PriorityResult(priority=IncidentPriority(level=level, reason=reason), rule_id=rule_id,
+                                  ruleset_version=RULESET_VERSION)
+    return PriorityResult(priority=IncidentPriority(level=None, reason=INSUFFICIENT), rule_id="P1",
+                          ruleset_version=RULESET_VERSION)
