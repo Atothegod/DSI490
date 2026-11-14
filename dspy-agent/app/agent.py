@@ -3,9 +3,9 @@ Agent 1 — Case Manager + Decision & Safety Logic (หัวข้อ 3, 5, 8, 
 
 ลำดับต่อข้อความ
     Consent → Raw Message → Privacy Filter → Extraction (Gemini) → ground() → Merge Draft
-    → Priority Engine → Decision: ช่องทางฉุกเฉิน / คำแนะนำ KB / ให้กำลังใจ / ถาม Slot / สรุปให้ยืนยัน
+    → Context completeness → Decision: ช่องทางฉุกเฉิน / คำแนะนำ KB / ให้กำลังใจ / ถาม Slot / สรุปให้ยืนยัน
 
-โค้ดเป็นผู้ตัดสินทุกอย่างที่มีผลต่อการช่วยเหลือ: สร้าง/สลับเคส, Slot ถัดไป, Priority, เบอร์ฉุกเฉิน, Version
+โค้ดเป็นผู้ตัดสินทุกอย่างที่มีผลต่อการช่วยเหลือ: สร้าง/สลับเคส, Slot ถัดไป และ Version
 Gemini ใช้ 2 จุด: Extractor (สกัด + จำแนกเจตนา) และ Response Generator (เรียบเรียงคำแนะนำ/ให้กำลังใจ)
 Agent 1 ไม่ปิดเคสเอง ไม่ยืนยันแทนผู้ใช้ และไม่ส่ง Draft ให้ Pipeline
 """
@@ -19,10 +19,10 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Callable
 
-from . import priority as priority_engine
 from .case import (
     Case,
     all_slots_satisfied,
+    append_raw,
     diff_snapshots,
     mark_asked,
     missing_notice,
@@ -32,16 +32,16 @@ from .case import (
     summary_text,
     version_snapshot,
 )
-from .extraction import Extractor, ground, needs_answer_from_keywords
+from .extraction import Extractor, ground, is_medical_or_distress
 from .knowledge import KBDoc, KnowledgeBase
 from .privacy import FilterResult, filter_text, normalize_text
-from .response import ResponseGenerator
+from .response import ResponseGenerator, FORBIDDEN, ADVICE_WORDS
 from .schemas import (
     AFFECTED_GROUPS,
-    RISK_FACTS,
     SLOT_LABELS_TH,
     CaseIntent,
     CaseStatus,
+    ConversationTurn,
     Extraction,
     IncidentData,
     IntakeStatus,
@@ -122,11 +122,6 @@ class Agent1:
             reply.add(self.t["consent_declined"] if channels else self.t["consent_declined_no_kb"])
             self._add_channels(reply, channels)
         else:
-            # ยังไม่ยินยอม: ไม่บันทึกข้อความ แต่ถ้ามีสัญญาณคุกคามชีวิตให้ช่องทางฉุกเฉินก่อน
-            if text and ground(Extraction(), normalize_text(text)).risk_facts.life_threat == "true":
-                if (ems := self.kb.hotline("1669")):
-                    reply.add(self.t["critical_opening"])
-                    self._add_channels(reply, [ems])
             reply.add(self.t["privacy_notice"])
             reply.quick_replies = [QuickReply(label=self.labels["consent_yes"], data="consent=yes"),
                                    QuickReply(label=self.labels["consent_no"], data="consent=no")]
@@ -145,17 +140,16 @@ class Agent1:
             message_id = self.store.add_raw(user["user_ref"], case.case_id if case else None, "in", "text", text)
         user["pending_question"] = None
 
-        if case is not None and self._direct_answer(case, f, text, reply):
+        if case is not None and case.context_complete and not is_medical_or_distress(f.text) and self._direct_answer(case, f, text, reply):
             return self._finish(user, case, reply)
 
-        ex = ground(self.extract(f.text, case.incident if case else IncidentData(),
+        ex = ground(self.extract(f.text, case.display_incident() if case else IncidentData(),
                                  case.pending_question if case else None,
-                                 case.conversation_summary if case else ""), f.text)
+                                 self._conversation_context(case) if case else ""), f.text)
 
         # Multi-Case: เจตนาและการยืนยันเป็นตัวแยกเคส ไม่ใช้ระยะทาง
         actives = self.store.active_cases(user["user_ref"])
-        has_incident = bool(MessageIntent.INCIDENT in ex.intents or ex.problem or ex.needs
-                            or ex.affected_people.has_anyone() or ex.risk_facts.life_threat == "true")
+        has_incident = bool(ex.intents or ex.problem or ex.affected_people.has_anyone())
         if ex.case_intent == CaseIntent.UNCLEAR and len(actives) > 1 and not selected:
             return self._ask_case_selection(user, actives, message_id, reply)
         if case is None and len(actives) > 1 and has_incident and not selected:
@@ -169,15 +163,15 @@ class Agent1:
             case = self._open_case(user)
         if case is None:
             # ถามหรือระบายความรู้สึกโดยยังไม่แจ้งเหตุ: ตอบได้โดยไม่สร้างเคส
-            self._support(reply, None, ex, f, set())
+            self._support(reply, None, ex, f)
             reply.add(self.t["greeting"] if not reply.parts else None)
             return self._finish(user, None, reply)
 
         self.store.attach_raw(message_id, case.case_id)
         if ex.case_intent == CaseIntent.RELOCATE:
             case.expect_relocation = True
-        newly_true = self._merge(case, ex, f)
-        self._support(reply, case, ex, f, newly_true)
+        self._merge(case, ex, f)
+        self._support(reply, case, ex, f)
         if ex.case_intent == CaseIntent.RELOCATE and not ex.problem:
             reply.add(self.t["relocation_ask_pin"])
             reply.quick_replies = [QuickReply(type="location", label=self.labels["share_location"])]
@@ -219,6 +213,8 @@ class Agent1:
     def _name_parts(text: str) -> list[str] | None:
         t = _POLITE.sub("", _NAME_PREFIX.sub("", normalize_text(text).strip()))
         parts = t.split()
+        if is_medical_or_distress(t):
+            return None
         if not 1 <= len(parts) <= 2 or "?" in t or any(w in t for w in _NOT_A_NAME):
             return None
         if not all(re.fullmatch(r"[ก-๙A-Za-z.\-]{2,30}", p) for p in parts):
@@ -226,13 +222,11 @@ class Agent1:
         return parts
 
     # ------------------------------------------------------------------
-    # Merge Draft + Priority
+    # Merge Draft
     # ------------------------------------------------------------------
 
-    def _merge(self, case: Case, ex: Extraction, f: FilterResult) -> set[str]:
-        before = (case.incident.model_dump(), case.risk_facts.model_dump(), case.personal.model_dump(),
-                  case.slots[SlotName.NEEDS].status)
-        old_facts = case.risk_facts.model_dump()
+    def _merge(self, case: Case, ex: Extraction, f: FilterResult) -> None:
+        before = (case.incident.model_dump(), case.personal.model_dump(), case.context_complete)
         p = case.personal
         if f.phones and (not p.phone_number or case.pending_question == SlotName.PHONE_NUMBER.value):
             p.phone_number = f.phones[0]
@@ -242,42 +236,38 @@ class Agent1:
             p.last_name = f.last_names[0]
         case.address_masked = case.address_masked or f.address_masked
 
+        # DB เก็บข้อความต้นฉบับ (evidence) ส่วนฉบับเรียบเรียงจาก LLM ใช้แสดงผล
         if ex.problem:
-            case.incident.problem = ex.problem
-        needs_slot = case.slots[SlotName.NEEDS]
-        if ex.needs:
-            case.incident.needs = ex.needs
-            needs_slot.evidence = ex.needs_evidence
-        else:
-            answer = ex.needs_answer
-            if answer is None and case.pending_question == SlotName.NEEDS.value:
-                answer = needs_answer_from_keywords(f.text)
-            if answer and not case.incident.needs:
-                needs_slot.status = SlotStatus.ANSWERED_NONE if answer == "none" else SlotStatus.ANSWERED_UNKNOWN
-                needs_slot.answered_at = now_bkk()
-                needs_slot.evidence = answer
+            case.incident.problem = append_raw(case.incident.problem, ex.problem_evidence)
+            case.problem_display = ex.problem
+        if ex.problem or ex.context_question:
+            case.context_complete = bool(ex.context_complete and case.incident.problem)
+            question = ex.context_question or ""
+            # Clarification is a request for information, never uncited treatment advice.
+            filtered_question = filter_text(question).text
+            if question and filtered_question == question and not FORBIDDEN.search(question) and not ADVICE_WORDS.search(question):
+                case.context_question = question
+            else:
+                case.context_question = None
+            if case.context_complete:
+                case.context_question = None
         for group in AFFECTED_GROUPS:
             if (value := getattr(ex.affected_people, group)) is not None:
                 setattr(case.incident.affected_people, group, value)
-        for fact in RISK_FACTS:
-            if (value := getattr(ex.risk_facts, fact)) != "unknown":
-                setattr(case.risk_facts, fact, value)
-                case.risk_fact_evidence[fact] = ex.risk_fact_evidence.get(fact, "")
-        case.danger_signals += [s for s in ex.danger_signals if s not in case.danger_signals]
-
         case.last_user_at = now_bkk()
         case.last_intents = [i.value for i in ex.intents]
         recent = [*filter(None, case.conversation_summary.split("\n")), f.text[:200]]
         case.conversation_summary = "\n".join(recent[-SUMMARY_MESSAGES:])
 
-        after = (case.incident.model_dump(), case.risk_facts.model_dump(), case.personal.model_dump(),
-                 case.slots[SlotName.NEEDS].status)
+        ctx = case.conversation_context
+        ctx.turns.append(ConversationTurn(role="user", text=f.text[:600]))
+        ctx.turns = ctx.turns[-8:]
+        after = (case.incident.model_dump(), case.personal.model_dump(), case.context_complete)
         if after != before:
             self._data_changed(case)
-        return {k for k, v in case.risk_facts.model_dump().items() if v == "true" and old_facts[k] != "true"}
 
     def _data_changed(self, case: Case) -> None:
-        """Draft เปลี่ยน: เปิดร่างการแก้ไขถ้าเคสยืนยันแล้ว และประเมิน Priority ใหม่"""
+        """Draft เปลี่ยน: เปิดร่างการแก้ไขถ้าเคสยืนยันแล้ว"""
         if case.intake_status == IntakeStatus.CONFIRMED and not case.editing:
             case.editing = True
             case.draft_round += 1
@@ -290,51 +280,38 @@ class Agent1:
             case.intake_status = IntakeStatus.COLLECTING
         case.touch(changed=True)
         refresh_slots(case)
-        result = priority_engine.evaluate(case.risk_facts, needs=case.incident.needs,
-                                          needs_status=case.slots[SlotName.NEEDS].status, danger_signals=case.danger_signals)
-        self.store.add_event(case.case_id, "priority_evaluated", {
-            "rule_id": result.rule_id, "ruleset_version": result.ruleset_version,
-            "level": result.priority.level.value if result.priority.level else None, "evaluated_at": now_bkk().isoformat()})
-        if result.priority != case.priority:
-            self.store.add_event(case.case_id, "priority_changed", {
-                "old": case.priority.level.value if case.priority.level else None,
-                "new": result.priority.level.value if result.priority.level else None, "rule_id": result.rule_id})
-        case.priority, case.priority_rule_id = result.priority, result.rule_id
-
-    # ------------------------------------------------------------------
-    # Support: ช่องทางฉุกเฉิน + คำแนะนำ KB + ให้กำลังใจ
-    # ------------------------------------------------------------------
-
-    def _support(self, reply: Reply, case: Case | None, ex: Extraction, f: FilterResult, newly_true: set[str]) -> None:
-        facts = case.risk_facts if case else ex.risk_facts
-        channels = self.kb.emergency_channels(facts, ex.intents)
-        asked_contact = [h.doc for h in self.kb.search(f.text) if h.doc.category == "emergency" and h.score >= 1.0]
-        shown = case.channels_shown if case else []
-        fresh = [d for d in dict.fromkeys(channels + asked_contact) if d.hotline not in shown or d in asked_contact]
-        if fresh and facts.life_threat == "true" and ("life_threat" in newly_true or case is None):
-            reply.add(self.t["critical_opening"])
-        self._add_channels(reply, fresh)
-        if case:
-            case.channels_shown += [d.hotline for d in fresh if d.hotline not in case.channels_shown]
-
-        query = None
-        if MessageIntent.QUESTION in ex.intents:
-            query = ex.question or f.text
-        elif newly_true & {"life_threat", "trapped", "water_rising", "unsafe_to_evacuate"}:
-            query = f.text
-        docs = [h.doc for h in self.kb.search(query, include_emergency=False)] if query else []
+    # Knowledge-grounded support without severity classification.
+    def _support(self, reply: Reply, case: Case | None, ex: Extraction, f: FilterResult) -> None:
+        # Search using the current problem as well, so "ทำไงดี" keeps its subject.
+        problem = case.problem_text if case else ex.problem
+        query = " ".join(filter(None, (problem, ex.question or f.text)))
+        docs = [h.doc for h in self.kb.search(query, limit=1)] if ex.question or ex.problem else []
         allowed = {str(getattr(case.incident.affected_people, g)) for g in AFFECTED_GROUPS} if case else set()
-        allowed |= {d.hotline for d in fresh}
-        composed = self.generate(f.text, need_empathy=MessageIntent.EMOTIONAL in ex.intents, docs=docs,
-                                 allowed_numbers=allowed, empathy_template=self.t["empathy"])
-        reply.add(composed.text)
+        composed = self.generate(f.text, need_empathy=MessageIntent.EMOTIONAL in ex.intents,
+                                 docs=docs, allowed_numbers=allowed,
+                                 empathy_template=self._empathy_template(f.text),
+                                 conversation_context=self._conversation_context(case) if case else "")
+        if not case or composed.text != case.conversation_context.last_support:
+            reply.add(composed.text)
+        if case:
+            case.conversation_context.last_support = composed.text
         reply.kb_doc_ids += composed.kb_doc_ids
-        if MessageIntent.QUESTION in ex.intents and not docs and not asked_contact:
+        if MessageIntent.QUESTION in ex.intents and not docs:
             reply.add(self.t["no_kb_info"])
-            fallback = [d for d in self.kb.fallback_channels() if d not in fresh]
-            if fallback:
-                reply.add(self.t["no_kb_channels"])
-                self._add_channels(reply, fallback)
+
+    def _empathy_template(self, text: str) -> str:
+        for word, message in self.t["empathy_by_feeling"].items():
+            if word in text:
+                return message
+        return self.t["empathy"]
+
+    def _conversation_context(self, case: Case) -> str:
+        # Re-filter on read as well, including names already held in the contact table.
+        text = case.conversation_context.model_dump_json() + "\n" + case.conversation_summary
+        for value in (case.personal.first_name, case.personal.last_name, case.personal.phone_number):
+            if value:
+                text = text.replace(value, "[PERSONAL]")
+        return filter_text(text).text
 
     def _add_channels(self, reply: Reply, docs: list[KBDoc]) -> None:
         for d in docs:
@@ -351,6 +328,16 @@ class Agent1:
             return
         if case.intake_status == IntakeStatus.CONFIRMED:
             reply.quick_replies = [QuickReply(label=self.labels["new_case"], data="new_case")]
+            return
+        # Complete the meaning of problem before asking contact/location slots.
+        # Unlike administrative slots, this is not capped at two questions.
+        if not case.context_complete:
+            case.pending_question = SlotName.PROBLEM.value
+            case.intake_status = IntakeStatus.COLLECTING
+            question = case.context_question or self.t["ask"]["problem"]
+            reply.add(question)
+            case.slots[SlotName.PROBLEM].ask_count += 1
+            case.slots[SlotName.PROBLEM].asked_at = now_bkk()
             return
         if all_slots_satisfied(case):
             if case.intake_status == IntakeStatus.AWAITING_CONFIRMATION:
@@ -547,7 +534,7 @@ class Agent1:
         user["pending_question"] = "case_selection"
         user["held_message_id"] = message_id
         reply.add(self.t["case_selection"])
-        reply.quick_replies = [QuickReply(label=f"{c.case_id[-6:]} {(c.incident.problem or 'ยังไม่ระบุ')}"[:20],
+        reply.quick_replies = [QuickReply(label=f"{c.case_id[-6:]} {(c.problem_text or 'ยังไม่ระบุ')}"[:20],
                                           data=f"case_select={c.case_id}") for c in actives[-13:]]
         return self._finish(user, None, reply)
 
@@ -565,8 +552,6 @@ class Agent1:
                 continue
             reply = Reply()
             reply.add(self.t["draft_reminder"])
-            if case.critical:
-                self._add_channels(reply, self.kb.emergency_channels(case.risk_facts, []))
             case.reminder_sent = True
             self.store.save_case(case)
             self.store.add_event(case.case_id, "draft_reminder_sent", {"draft_round": case.draft_round})
@@ -593,6 +578,15 @@ class Agent1:
     def _finish(self, user, case: Case | None, reply: Reply) -> TurnOutput:
         if case is not None:
             refresh_slots(case)
+            if case.pending_question == SlotName.PROBLEM.value and reply.parts:
+                case.conversation_context.turns.append(ConversationTurn(role="assistant", text=reply.parts[-1][:600]))
+                case.conversation_context.turns = case.conversation_context.turns[-8:]
+            for turn in case.conversation_context.turns:
+                for value in (case.personal.first_name, case.personal.last_name, case.personal.phone_number):
+                    if value:
+                        turn.text = turn.text.replace(value, "[PERSONAL]")
+                turn.text = filter_text(turn.text).text[:600]
+            case.conversation_context.last_support = filter_text(case.conversation_context.last_support).text[:600]
             self.store.save_case(case)
         self.store.save_user(user)
         out = self._output(reply, case, user)

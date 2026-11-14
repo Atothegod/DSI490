@@ -1,7 +1,6 @@
 """
-Persistent Memory + Versioning (หัวข้อ 8, 11, 12) — PostgreSQL ตอนใช้งาน, SQLite ตอนรันในเครื่อง/ทดสอบ
-
-ตารางตามหัวข้อ 11 ข้อมูลส่วนบุคคลอยู่ใน case_personal_data, case_version_contacts และ user_line_ids เท่านั้น
+Persistent Memory + Versioning  — PostgreSQL ตอนใช้งาน, SQLite ตอนรันในเครื่อง/ทดสอบ
+ข้อมูลส่วนบุคคลอยู่ใน case_personal_data, case_version_contacts และ user_line_ids เท่านั้น
 case_versions และ case_events เขียนเพิ่มอย่างเดียว ไม่แก้ย้อนหลัง
 Pipeline อ่านผ่าน View pipeline_confirmed_cases (ไม่มีชื่อ/เบอร์) และ pipeline_case_contacts (Role จำกัด)
 สิทธิ์ Role ของ PostgreSQL อยู่ที่ db/pipeline_roles.sql
@@ -17,7 +16,7 @@ from datetime import datetime
 from uuid import uuid4
 
 from .case import Case
-from .schemas import SCHEMA_VERSION, CaseStatus, IncidentPriority, Location, PersonalData, SlotName, SlotState, now_bkk
+from .schemas import SCHEMA_VERSION, CaseStatus, Location, PersonalData, SlotName, SlotState, now_bkk
 
 TABLES = (
     """CREATE TABLE IF NOT EXISTS users (
@@ -52,6 +51,10 @@ _LATEST = """SELECT v.case_id, v.version, v.schema_version, c.case_status, v.con
     v.latitude, v.longitude, v.priority_level, v.priority_reason
     FROM case_versions v JOIN cases c ON c.case_id = v.case_id
     WHERE v.version = (SELECT MAX(v2.version) FROM case_versions v2 WHERE v2.case_id = v.case_id)"""
+# Keep the old SQL view/columns for existing installations; the v2 contract
+# omits priority altogether. Physical legacy columns are not assessed or dropped.
+_LATEST_V2 = _LATEST.replace(
+    "v.latitude, v.longitude, v.priority_level, v.priority_reason", "v.latitude, v.longitude")
 _CONTACTS = """SELECT k.case_id, k.version, k.first_name, k.last_name, k.phone_number FROM case_version_contacts k
     WHERE k.version = (SELECT MAX(k2.version) FROM case_version_contacts k2 WHERE k2.case_id = k.case_id)"""
 
@@ -71,6 +74,7 @@ class Store:
             create = "CREATE OR REPLACE VIEW" if self.postgres else "CREATE VIEW IF NOT EXISTS"
             self._exec(c, f"{create} pipeline_confirmed_cases AS {_LATEST}")
             self._exec(c, f"{create} pipeline_case_contacts AS {_CONTACTS}")
+            self._exec(c, f"{create} pipeline_confirmed_cases_v2 AS {_LATEST_V2}")
 
     @contextmanager
     def transaction(self):
@@ -141,12 +145,12 @@ class Store:
         d, s = json.loads(draft[1]), json.loads(slots[1])
         return Case(
             case_id=case_id, user_ref=row[0], case_status=row[1], intake_status=row[2],
-            priority=IncidentPriority(level=row[3], reason=row[4]), current_version=row[5],
+            current_version=row[5],
             created_at=row[6], updated_at=row[7], confirmed_at=row[8], draft_rev=draft[0],
             personal=PersonalData(first_name=p[0], last_name=p[1], phone_number=p[2],
                                   location=Location(latitude=p[3], longitude=p[4]) if p[3] is not None else None),
             pending_location=Location(latitude=p[5], longitude=p[6]) if p[5] is not None else None,
-            pending_question=slots[0], slots={SlotName(k): SlotState.model_validate(v) for k, v in s.pop("slots").items()},
+            pending_question=slots[0], slots={k: SlotState.model_validate(v) for k, v in s.pop("slots").items() if k != "needs"},
             **d, **s,
         )
 
@@ -159,20 +163,20 @@ class Store:
         if seq is not None:
             self._exec(c, "INSERT INTO cases VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                        (case.case_id, seq, case.user_ref, case.case_status.value, case.intake_status.value,
-                        None, case.priority.reason, 0, iso(case.created_at), iso(case.updated_at), None))
+                        None, "", 0, iso(case.created_at), iso(case.updated_at), None))
         else:
             self._exec(c, "UPDATE cases SET case_status=?, intake_status=?, priority_level=?, priority_reason=?, current_version=?, "
                           "updated_at=?, confirmed_at=? WHERE case_id=?",
-                       (case.case_status.value, case.intake_status.value, case.priority.level.value if case.priority.level else None,
-                        case.priority.reason, case.current_version, iso(case.updated_at), iso(case.confirmed_at), case.case_id))
+                       (case.case_status.value, case.intake_status.value, None,
+                        "", case.current_version, iso(case.updated_at), iso(case.confirmed_at), case.case_id))
         p, loc, pend = case.personal, case.personal.location, case.pending_location
         personal = (p.first_name, p.last_name, p.phone_number, loc and loc.latitude, loc and loc.longitude,
                     pend and pend.latitude, pend and pend.longitude)
         draft = case.model_dump(mode="json", include={
-            "incident", "risk_facts", "risk_fact_evidence", "danger_signals", "editing", "draft_round", "reminder_sent",
-            "last_user_at", "address_masked", "channels_shown", "priority_rule_id"})
+            "incident", "problem_display", "editing", "draft_round", "reminder_sent",
+            "last_user_at", "address_masked", "channels_shown"})
         slots = case.model_dump(mode="json", include={
-            "slots", "missing_notice_sent", "expect_relocation", "reuse_contact_asked", "last_intents", "conversation_summary"})
+            "slots", "missing_notice_sent", "expect_relocation", "reuse_contact_asked", "last_intents", "conversation_summary", "conversation_context", "context_complete", "context_question"})
         upsert = "INSERT INTO {t} VALUES ({q}) ON CONFLICT(case_id) DO UPDATE SET {s}"
         self._exec(c, upsert.format(t="case_personal_data", q="?,?,?,?,?,?,?,?", s=", ".join(
             f"{k}=excluded.{k}" for k in ("first_name", "last_name", "phone_number", "latitude", "longitude",
@@ -201,7 +205,7 @@ class Store:
             self._exec(c, "INSERT INTO case_versions VALUES (?,?,?,?,?,?,?,?,?)",
                        (case.case_id, case.current_version, SCHEMA_VERSION, case.confirmed_at.isoformat(),
                         json.dumps(snapshot["incident"], ensure_ascii=False), loc.latitude, loc.longitude,
-                        case.priority.level.value if case.priority.level else None, case.priority.reason))
+                        None, ""))
             self._exec(c, "INSERT INTO case_version_contacts VALUES (?,?,?,?,?)",
                        (case.case_id, case.current_version, p.first_name, p.last_name, p.phone_number))
             self._write_case(c, case)
@@ -217,11 +221,10 @@ class Store:
     def pipeline_rows(self) -> list[dict]:
         """สิ่งที่ Pipeline เห็นผ่าน View — ใช้ในการทดสอบ Data Contract"""
         with self.transaction() as c:
-            rows = self._exec(c, "SELECT * FROM pipeline_confirmed_cases").fetchall()
+            rows = self._exec(c, "SELECT * FROM pipeline_confirmed_cases_v2").fetchall()
         return [{
             "case_id": r[0], "version": r[1], "schema_version": r[2], "case_status": r[3], "confirmed_at": r[4],
             "incident": json.loads(r[5]), "location": {"latitude": r[6], "longitude": r[7]},
-            "incident_priority": {"level": r[8], "reason": r[9]},
         } for r in rows]
 
     def add_event(self, case_id: str | None, event: str, payload: dict | None = None) -> None:

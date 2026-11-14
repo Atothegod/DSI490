@@ -15,6 +15,7 @@ import hmac
 import json
 import logging
 import os
+import secrets
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -22,7 +23,7 @@ from pathlib import Path
 import dspy
 import httpx
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, model_validator
 
@@ -100,7 +101,13 @@ def send_reminders(agent: Agent1, store: Store) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.model = configure_dspy()
-    app.state.store = Store(os.getenv("DATABASE_URL", "sqlite:///agent1.sqlite3"))
+    database_url = os.getenv("DATABASE_URL", "sqlite:///agent1.sqlite3")
+    app.state.store = Store(database_url)
+    app.state.local_inspector_token = (
+        secrets.token_urlsafe(32)
+        if os.getenv("LOCAL_CHAT_INSPECTOR") == "1" and database_url == "sqlite:///:memory:"
+        else None
+    )
     knowledge = KnowledgeBase(os.getenv("KNOWLEDGE_PATH", str(APP_DIR / "knowledge_th.csv")),
                               threshold=float(os.getenv("RAG_THRESHOLD", "0.12")),
                               allow_unreviewed=os.getenv("KB_ALLOW_UNREVIEWED") == "1")
@@ -149,9 +156,50 @@ def chat(payload: ChatRequest) -> TurnOutput:
 
 
 @app.get("/dev/chat", include_in_schema=False)
-def dev_chat() -> FileResponse:
+def dev_chat(request: Request) -> FileResponse:
     """หน้าแชตจำลอง LINE สำหรับทดสอบ เรียก POST /chat เหมือนกัน"""
-    return FileResponse(APP_DIR / "static" / "chat.html")
+    response = FileResponse(APP_DIR / "static" / "chat.html")
+    response.headers["Cache-Control"] = "no-store"
+    token = getattr(app.state, "local_inspector_token", None)
+    if token and request.client and request.client.host in {"127.0.0.1", "::1"}:
+        response.set_cookie("local_chat_inspector", token, httponly=True, samesite="strict", path="/dev")
+    return response
+
+
+def require_local_inspector(request: Request):
+    token = getattr(app.state, "local_inspector_token", None)
+    if not token:
+        raise HTTPException(status_code=404, detail="Local inspector is disabled")
+    supplied = request.cookies.get("local_chat_inspector", "")
+    if (not request.client or request.client.host not in {"127.0.0.1", "::1"}
+            or not hmac.compare_digest(supplied, token)):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+@app.get("/dev/inspector", dependencies=[Depends(require_local_inspector)], include_in_schema=False)
+def local_inspector(user_id: str, response: Response):
+    """Read actual draft/confirmed rows from the disposable localhost test DB."""
+    response.headers["Cache-Control"] = "no-store"
+    with app.state.lock:
+        store = app.state.store
+        with store.transaction() as cursor:
+            rows = store._exec(cursor,
+                "SELECT d.case_id, d.draft_rev, c.intake_status, d.payload FROM case_drafts d "
+                "JOIN cases c ON c.case_id=d.case_id WHERE c.user_ref=? ORDER BY c.seq", (user_id,)).fetchall()
+            drafts = [{"case_id": row[0], "draft_rev": row[1], "intake_status": row[2],
+                       "incident": json.loads(row[3])["incident"]} for row in rows]
+            contacts = store._exec(cursor,
+                "SELECT p.case_id,p.first_name,p.last_name,p.phone_number FROM case_personal_data p "
+                "JOIN cases c ON c.case_id=p.case_id WHERE c.user_ref=? ORDER BY c.seq", (user_id,)).fetchall()
+            confirmed_contacts = store._exec(cursor,
+                "SELECT p.case_id,p.version,p.first_name,p.last_name,p.phone_number FROM pipeline_case_contacts p "
+                "JOIN cases c ON c.case_id=p.case_id WHERE c.user_ref=? ORDER BY c.seq", (user_id,)).fetchall()
+        ids = {draft["case_id"] for draft in drafts}
+        pipeline = [row for row in store.pipeline_rows() if row["case_id"] in ids]
+        return {"user_id": user_id, "database": "SQLite (temporary)", "drafts": drafts,
+                "pipeline": pipeline,
+                "draft_contacts": [dict(zip(("case_id", "first_name", "last_name", "phone_number"), row)) for row in contacts],
+                "confirmed_contacts": [dict(zip(("case_id", "version", "first_name", "last_name", "phone_number"), row)) for row in confirmed_contacts]}
 
 
 def require_admin(authorization: str | None = Header(default=None)):
@@ -175,7 +223,7 @@ def dev_database(user_id: str):
                 "case_raw_messages": ("SELECT * FROM case_raw_messages WHERE user_ref=? ORDER BY created_at", (user_id,)),
             }
             for name in ("case_personal_data", "case_drafts", "case_slots", "case_versions",
-                         "case_version_contacts", "case_events", "pipeline_confirmed_cases", "pipeline_case_contacts"):
+                         "case_version_contacts", "case_events", "pipeline_confirmed_cases", "pipeline_confirmed_cases_v2", "pipeline_case_contacts"):
                 queries[name] = (f"SELECT * FROM {name} WHERE case_id IN (SELECT case_id FROM cases WHERE user_ref=?)", (user_id,))
             for name, (sql, args) in queries.items():
                 cursor = store._exec(c, sql, args)

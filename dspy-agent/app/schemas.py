@@ -1,12 +1,8 @@
 """
-Agent 1 schemas — อ้างอิงเอกสาร "DSI490 — การออกแบบ Agent 1 ฉบับปรับปรุง" (เลขหัวข้อในโค้ดอ้างตามเอกสารนี้)
-
-แบ่งตามสิทธิ์การเข้าถึง (หัวข้อ 6)
     Incident Data          เข้า LLM ได้                       IncidentData
     Personal Data          ห้ามเข้า LLM                       PersonalData
-    Case Metadata          ควบคุมระบบ                         CaseStatus, IntakeStatus, IncidentPriority
+    Case Metadata          ควบคุมระบบ                         CaseStatus, IntakeStatus
     Conversation State     ควบคุมการสนทนา                     SlotName, SlotState
-    Priority Internal      ตรวจสอบภายใน ไม่ส่งให้ Pipeline    RiskFacts, PriorityResult
 """
 
 from __future__ import annotations
@@ -17,7 +13,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "2.0"
 BANGKOK_TZ = timezone(timedelta(hours=7), name="Asia/Bangkok")
 
 
@@ -63,8 +59,18 @@ AFFECTED_LABELS_TH = {"children": "เด็ก", "elderly": "ผู้สูง
 
 class IncidentData(StrictModel):
     problem: str | None = None
-    needs: str | None = None
     affected_people: AffectedPeople = Field(default_factory=AffectedPeople)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy_needs(cls, value):
+        if isinstance(value, dict):
+            value = dict(value)
+            needs = value.pop("needs", None)
+            if needs:
+                problem = value.get("problem") or ""
+                value["problem"] = problem if needs in problem else " ".join(filter(None, (problem, needs)))
+        return value
 
 
 # ---------------------------------------------------------------------------
@@ -101,20 +107,6 @@ class IntakeStatus(str, Enum):
     CONFIRMED = "confirmed"
 
 
-class PriorityLevel(str, Enum):
-    CRITICAL = "critical"
-    HIGH = "high"
-    MEDIUM = "medium"
-    LOW = "low"
-
-
-class IncidentPriority(StrictModel):
-    """ส่วนเดียวของ Priority ที่ Pipeline เห็น"""
-
-    level: PriorityLevel | None = None
-    reason: str = "ข้อมูลไม่เพียงพอสำหรับการประเมิน"
-
-
 # ---------------------------------------------------------------------------
 # 6.4 Conversation State + Slot Tracking (หัวข้อ 8)
 # ---------------------------------------------------------------------------
@@ -122,7 +114,6 @@ class IncidentPriority(StrictModel):
 
 class SlotName(str, Enum):
     PROBLEM = "problem"
-    NEEDS = "needs"
     AFFECTED_PEOPLE = "affected_people"
     LOCATION = "location"
     FIRST_NAME = "first_name"
@@ -131,7 +122,7 @@ class SlotName(str, Enum):
 
 
 SLOT_LABELS_TH = {
-    SlotName.PROBLEM: "ปัญหาที่พบ", SlotName.NEEDS: "ความช่วยเหลือที่ต้องการ",
+    SlotName.PROBLEM: "ปัญหาและรายละเอียด",
     SlotName.AFFECTED_PEOPLE: "จำนวนผู้ประสบภัย", SlotName.LOCATION: "หมุดจุดเกิดเหตุ",
     SlotName.FIRST_NAME: "ชื่อ", SlotName.LAST_NAME: "นามสกุล", SlotName.PHONE_NUMBER: "เบอร์โทรศัพท์",
 }
@@ -141,8 +132,6 @@ MAX_SLOT_ASKS = 2
 class SlotStatus(str, Enum):
     MISSING = "missing"
     FILLED = "filled"
-    ANSWERED_NONE = "answered_none"  # ใช้กับ needs เท่านั้น
-    ANSWERED_UNKNOWN = "answered_unknown"  # ใช้กับ needs เท่านั้น
 
 
 class SlotState(StrictModel):
@@ -155,6 +144,26 @@ class SlotState(StrictModel):
     @property
     def satisfied(self) -> bool:
         return self.status != SlotStatus.MISSING
+
+
+class ConversationTurn(StrictModel):
+    role: Literal["user", "assistant"]
+    text: str = Field(max_length=600)
+
+
+class ConversationContext(StrictModel):
+    # Internal only: not part of the confirmed incident or pipeline contract.
+    turns: list[ConversationTurn] = Field(default_factory=list)
+    last_support: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy_context(cls, value):
+        if isinstance(value, dict):
+            value = dict(value)
+            for key in ("pending_followup", "asked_topics", "safety_focus", "medical_step", "medical_contact_status"):
+                value.pop(key, None)
+        return value
 
 
 class MessageIntent(str, Enum):
@@ -172,32 +181,6 @@ class CaseIntent(str, Enum):
 
 
 # ---------------------------------------------------------------------------
-# 6.5 Priority Internal Data (หัวข้อ 9)
-# ---------------------------------------------------------------------------
-
-Tri = Literal["true", "false", "unknown"]
-RISK_FACTS = ("life_threat", "trapped", "water_rising", "unsafe_to_evacuate", "cannot_self_evacuate",
-              "in_safe_place", "basic_needs_unmet", "essential_medication_risk")
-
-
-class RiskFacts(StrictModel):
-    life_threat: Tri = "unknown"
-    trapped: Tri = "unknown"
-    water_rising: Tri = "unknown"
-    unsafe_to_evacuate: Tri = "unknown"
-    cannot_self_evacuate: Tri = "unknown"
-    in_safe_place: Tri = "unknown"
-    basic_needs_unmet: Tri = "unknown"
-    essential_medication_risk: Tri = "unknown"
-
-
-class PriorityResult(StrictModel):
-    priority: IncidentPriority
-    rule_id: str
-    ruleset_version: str
-
-
-# ---------------------------------------------------------------------------
 # Information Extractor output (หัวข้อ 8)
 # ---------------------------------------------------------------------------
 
@@ -209,16 +192,26 @@ class Extraction(StrictModel):
     case_intent: CaseIntent = CaseIntent.SAME_CASE
     problem: str | None = None
     problem_evidence: str | None = None
-    needs: str | None = None
-    needs_evidence: str | None = None
-    needs_answer: Literal["none", "unknown"] | None = None  # ผู้ใช้ตอบว่าไม่มี / ไม่ทราบ
     affected_people: AffectedPeople = Field(default_factory=AffectedPeople)
     affected_people_evidence: dict[str, str] = Field(default_factory=dict)
     count_unclear: bool = False  # เช่น "หลายคน" "แม่ที่แก่แล้ว 2 คน" → ถามยืนยันจำนวน
-    risk_facts: RiskFacts = Field(default_factory=RiskFacts)
-    risk_fact_evidence: dict[str, str] = Field(default_factory=dict)
-    danger_signals: list[str] = Field(default_factory=list)
+    context_complete: bool = False
+    context_question: str | None = Field(default=None, max_length=240)
     question: str | None = None  # คำถามของผู้ใช้ ใช้ค้น Knowledge Base
+
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy_extraction(cls, value):
+        if not isinstance(value, dict):
+            return value
+        value = dict(value)
+        needs, evidence = value.pop("needs", None), value.pop("needs_evidence", None)
+        if needs and evidence:
+            value["problem"] = " ".join(filter(None, (value.get("problem"), needs)))
+            value["problem_evidence"] = " ".join(filter(None, (value.get("problem_evidence"), evidence)))
+        for key in ("needs_answer", "risk_facts", "risk_fact_evidence", "danger_signals"):
+            value.pop(key, None)
+        return value
 
 
 # ---------------------------------------------------------------------------
