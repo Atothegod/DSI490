@@ -3,7 +3,7 @@ Persistent Memory + Versioning  — PostgreSQL ตอนใช้งาน, SQLi
 ข้อมูลส่วนบุคคลอยู่ใน case_personal_data, case_version_contacts และ user_line_ids เท่านั้น
 case_versions และ case_events เขียนเพิ่มอย่างเดียว ไม่แก้ย้อนหลัง
 Pipeline อ่านผ่าน View pipeline_confirmed_cases (ไม่มีชื่อ/เบอร์) และ pipeline_case_contacts (Role จำกัด)
-สิทธิ์ Role ของ PostgreSQL อยู่ที่ db/pipeline_roles.sql
+กำหนดสิทธิ์ PostgreSQL ผ่าน views แยกข้อมูลเหตุและข้อมูลติดต่อ
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from datetime import datetime
 from uuid import uuid4
 
 from .case import Case
-from .schemas import SCHEMA_VERSION, CaseStatus, Location, PersonalData, SlotName, SlotState, now_bkk
+from .schemas import SCHEMA_VERSION, CaseStatus, Location, PersonalData, SlotState, now_bkk
 
 TABLES = (
     """CREATE TABLE IF NOT EXISTS users (
@@ -38,7 +38,8 @@ TABLES = (
     """CREATE TABLE IF NOT EXISTS case_versions (
         case_id TEXT NOT NULL, version INTEGER NOT NULL, schema_version TEXT NOT NULL, confirmed_at TEXT NOT NULL,
         incident TEXT NOT NULL, latitude DOUBLE PRECISION NOT NULL, longitude DOUBLE PRECISION NOT NULL,
-        priority_level TEXT, priority_reason TEXT NOT NULL, PRIMARY KEY (case_id, version))""",
+        priority_level TEXT, priority_reason TEXT NOT NULL, priority_evaluated_at TEXT, priority_rules_version TEXT,
+        PRIMARY KEY (case_id, version))""",
     """CREATE TABLE IF NOT EXISTS case_version_contacts (
         case_id TEXT NOT NULL, version INTEGER NOT NULL, first_name TEXT NOT NULL, last_name TEXT NOT NULL,
         phone_number TEXT NOT NULL, PRIMARY KEY (case_id, version))""",
@@ -55,6 +56,18 @@ _LATEST = """SELECT v.case_id, v.version, v.schema_version, c.case_status, v.con
 # omits priority altogether. Physical legacy columns are not assessed or dropped.
 _LATEST_V2 = _LATEST.replace(
     "v.latitude, v.longitude, v.priority_level, v.priority_reason", "v.latitude, v.longitude")
+# v3 (schema 3.0) เพิ่ม priority รายเคส ให้ Pipeline อ่านเมื่อพร้อมเท่านั้น v2 ไม่เปลี่ยนคอลัมน์
+_LATEST_V3 = """SELECT v.case_id, v.version, v.schema_version, c.case_status, v.confirmed_at, v.incident,
+    v.latitude, v.longitude, v.priority_level, v.priority_reason, v.priority_evaluated_at, v.priority_rules_version
+    FROM case_versions v JOIN cases c ON c.case_id = v.case_id
+    WHERE v.version = (SELECT MAX(v2.version) FROM case_versions v2 WHERE v2.case_id = v.case_id)"""
+# คอลัมน์ที่เพิ่มหลังสร้างตารางแล้ว ฐานข้อมูลเดิมต้องเติมให้ครบ (CREATE TABLE IF NOT EXISTS ไม่เพิ่มคอลัมน์ให้)
+# v4 is the current public contract: no audit metadata or raw risk facts.
+_LATEST_V4 = _LATEST.replace("v.priority_level, v.priority_reason", "COALESCE(v.priority_level, 'medium') AS incident_priority_level, v.priority_reason AS incident_priority_reason")
+_ADDED_COLUMNS = (
+    ("case_versions", "priority_evaluated_at", "TEXT"),
+    ("case_versions", "priority_rules_version", "TEXT"),
+)
 _CONTACTS = """SELECT k.case_id, k.version, k.first_name, k.last_name, k.phone_number FROM case_version_contacts k
     WHERE k.version = (SELECT MAX(k2.version) FROM case_version_contacts k2 WHERE k2.case_id = k.case_id)"""
 
@@ -71,10 +84,24 @@ class Store:
         with self.transaction() as c:
             for sql in TABLES:
                 self._exec(c, sql)
+            self._add_missing_columns(c)
             create = "CREATE OR REPLACE VIEW" if self.postgres else "CREATE VIEW IF NOT EXISTS"
             self._exec(c, f"{create} pipeline_confirmed_cases AS {_LATEST}")
             self._exec(c, f"{create} pipeline_case_contacts AS {_CONTACTS}")
             self._exec(c, f"{create} pipeline_confirmed_cases_v2 AS {_LATEST_V2}")
+            self._exec(c, f"{create} pipeline_confirmed_cases_v3 AS {_LATEST_V3}")
+            if not self.postgres:
+                self._exec(c, "DROP VIEW IF EXISTS pipeline_confirmed_cases_v4")
+            self._exec(c, f"{create} pipeline_confirmed_cases_v4 AS {_LATEST_V4}")
+
+    def _add_missing_columns(self, c) -> None:
+        for table, column, kind in _ADDED_COLUMNS:
+            if self.postgres:
+                self._exec(c, f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {kind}")
+            else:
+                existing = {row[1] for row in self._exec(c, f"PRAGMA table_info({table})").fetchall()}
+                if column not in existing:
+                    self._exec(c, f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
     @contextmanager
     def transaction(self):
@@ -160,23 +187,24 @@ class Store:
 
     def _write_case(self, c, case: Case, seq: int | None = None) -> None:
         iso = lambda t: t.isoformat() if t else None  # noqa: E731
+        level, reasons = priority_columns(case.priority)
         if seq is not None:
             self._exec(c, "INSERT INTO cases VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                        (case.case_id, seq, case.user_ref, case.case_status.value, case.intake_status.value,
-                        None, "", 0, iso(case.created_at), iso(case.updated_at), None))
+                        level, reasons, 0, iso(case.created_at), iso(case.updated_at), None))
         else:
             self._exec(c, "UPDATE cases SET case_status=?, intake_status=?, priority_level=?, priority_reason=?, current_version=?, "
                           "updated_at=?, confirmed_at=? WHERE case_id=?",
-                       (case.case_status.value, case.intake_status.value, None,
-                        "", case.current_version, iso(case.updated_at), iso(case.confirmed_at), case.case_id))
+                       (case.case_status.value, case.intake_status.value, level,
+                        reasons, case.current_version, iso(case.updated_at), iso(case.confirmed_at), case.case_id))
         p, loc, pend = case.personal, case.personal.location, case.pending_location
         personal = (p.first_name, p.last_name, p.phone_number, loc and loc.latitude, loc and loc.longitude,
                     pend and pend.latitude, pend and pend.longitude)
         draft = case.model_dump(mode="json", include={
             "incident", "problem_display", "editing", "draft_round", "reminder_sent",
-            "last_user_at", "address_masked", "channels_shown"})
+            "last_user_at", "address_masked", "priority", "priority_facts", "risk_fact_evidence", "emergency_notified"})
         slots = case.model_dump(mode="json", include={
-            "slots", "missing_notice_sent", "expect_relocation", "reuse_contact_asked", "last_intents", "conversation_summary", "conversation_context", "context_complete", "context_question"})
+            "slots", "missing_notice_sent", "expect_relocation", "reuse_contact_asked", "reuse_contact_source", "reuse_contact_source_rev", "last_intents", "conversation_summary", "conversation_context", "context_complete", "context_question", "context_paused", "pending_people_confirmation", "pending_people_label", "context_subject", "consultation_active", "help_status", "help_evidence"})
         upsert = "INSERT INTO {t} VALUES ({q}) ON CONFLICT(case_id) DO UPDATE SET {s}"
         self._exec(c, upsert.format(t="case_personal_data", q="?,?,?,?,?,?,?,?", s=", ".join(
             f"{k}=excluded.{k}" for k in ("first_name", "last_name", "phone_number", "latitude", "longitude",
@@ -192,6 +220,16 @@ class Store:
                                             (user_ref, CaseStatus.ACTIVE.value)).fetchall()]
         return [self.load_case(i) for i in ids]
 
+    def previous_contact_case(self, user_ref: str, exclude_case_id: str) -> Case | None:
+        """Latest complete contact for this reporter, including closed cases."""
+        with self.transaction() as cursor:
+            row = self._exec(cursor,
+                "SELECT c.case_id FROM cases c JOIN case_personal_data p ON p.case_id=c.case_id "
+                "WHERE c.user_ref=? AND c.case_id<>? AND COALESCE(p.first_name,'')<>'' "
+                "AND COALESCE(p.last_name,'')<>'' AND COALESCE(p.phone_number,'')<>'' "
+                "ORDER BY c.seq DESC LIMIT 1", (user_ref, exclude_case_id)).fetchone()
+        return self.load_case(row[0]) if row else None
+
     def all_active_cases(self) -> list[Case]:
         with self.transaction() as c:
             ids = [r[0] for r in self._exec(c, "SELECT case_id FROM cases WHERE case_status=?", (CaseStatus.ACTIVE.value,)).fetchall()]
@@ -201,11 +239,16 @@ class Store:
 
     def add_version(self, case: Case, snapshot: dict) -> None:
         loc, p = case.personal.location, case.personal
+        level, reasons = priority_columns(case.priority)
+        evaluated = case.priority.evaluated_at.isoformat() if case.priority else None
+        rules = case.priority.ruleset_version if case.priority else None
         with self.transaction() as c:
-            self._exec(c, "INSERT INTO case_versions VALUES (?,?,?,?,?,?,?,?,?)",
+            self._exec(c, "INSERT INTO case_versions (case_id, version, schema_version, confirmed_at, incident, latitude, "
+                          "longitude, priority_level, priority_reason, priority_evaluated_at, priority_rules_version) "
+                          "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                        (case.case_id, case.current_version, SCHEMA_VERSION, case.confirmed_at.isoformat(),
                         json.dumps(snapshot["incident"], ensure_ascii=False), loc.latitude, loc.longitude,
-                        None, ""))
+                        level, reasons, evaluated, rules))
             self._exec(c, "INSERT INTO case_version_contacts VALUES (?,?,?,?,?)",
                        (case.case_id, case.current_version, p.first_name, p.last_name, p.phone_number))
             self._write_case(c, case)
@@ -214,17 +257,14 @@ class Store:
         rows = [r for r in self.pipeline_rows() if r["case_id"] == case_id]
         return rows[0] if rows else None
 
-    def version_count(self, case_id: str) -> int:
-        with self.transaction() as c:
-            return self._exec(c, "SELECT COUNT(*) FROM case_versions WHERE case_id=?", (case_id,)).fetchone()[0]
-
     def pipeline_rows(self) -> list[dict]:
-        """สิ่งที่ Pipeline เห็นผ่าน View — ใช้ในการทดสอบ Data Contract"""
+        """Confirmed Pipeline v4: incident_priority contains only level and reason."""
         with self.transaction() as c:
-            rows = self._exec(c, "SELECT * FROM pipeline_confirmed_cases_v2").fetchall()
+            rows = self._exec(c, "SELECT * FROM pipeline_confirmed_cases_v4").fetchall()
         return [{
             "case_id": r[0], "version": r[1], "schema_version": r[2], "case_status": r[3], "confirmed_at": r[4],
             "incident": json.loads(r[5]), "location": {"latitude": r[6], "longitude": r[7]},
+            "incident_priority": {"level": r[8], "reason": priority_reason(r[9])},
         } for r in rows]
 
     def add_event(self, case_id: str | None, event: str, payload: dict | None = None) -> None:
@@ -276,3 +316,18 @@ class Store:
 
 def parse_time(value: str | datetime) -> datetime:
     return value if isinstance(value, datetime) else datetime.fromisoformat(value)
+
+
+def priority_reason(value) -> str:
+    """Read historical JSON reasons and current plain text without rewriting rows."""
+    if not value:
+        return "ข้อมูลไม่เพียงพอสำหรับการประเมิน"
+    try:
+        parsed = json.loads(value)
+    except (ValueError, TypeError):
+        return value
+    return "; ".join(parsed) if isinstance(parsed, list) else parsed
+
+
+def priority_columns(priority) -> tuple[str, str]:
+    return priority.level.value, priority.reason

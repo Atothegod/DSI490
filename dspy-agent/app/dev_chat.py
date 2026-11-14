@@ -17,6 +17,7 @@ def main():
     if not key:
         parser.error('Set GEMINI_API_KEY or GOOGLE_API_KEY in .env')
     os.environ['DATABASE_URL'] = 'sqlite:///:memory:'
+    os.environ['APP_ENV'] = 'development'
     os.environ['KB_ALLOW_UNREVIEWED'] = '1'
     os.environ['ENABLE_RESPONSE_GENERATOR'] = '1'
     os.environ['LOCAL_CHAT_INSPECTOR'] = '1'

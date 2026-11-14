@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 from dataclasses import dataclass
 from typing import Literal
 
@@ -59,6 +60,8 @@ class LineInput:
             return {"location": self.location}
         if self.kind == "postback":
             return {"postback": self.postback}
+        if self.kind == "follow":
+            return {"text": "สวัสดี"}
         raise ValueError("ข้อความชนิดนี้ไม่ส่งเข้า agent")
 
 
@@ -105,16 +108,90 @@ def _split_text(text: str) -> list[str]:
     return [p for p in parts if p][:MAX_MESSAGES]
 
 
-def build_messages(output: TurnOutput) -> list[dict]:
-    """messages สำหรับ Reply/Push API — Quick Reply ติดกับข้อความสุดท้าย"""
-    messages = [{"type": "text", "text": t} for t in _split_text(output.output_text)]
+def _button_label(reply) -> str:
+    """Decorate LINE's native buttons; keep the original postback/display text."""
+    data = reply.data or ""
+    if reply.type == "location":
+        icon = "⌖"
+    elif data.startswith("edit="):
+        icon = "✎"
+    elif data == "consent=yes" or data.startswith(("confirm=", "people_confirm=yes:", "reuse_contact=yes:", "intake=")):
+        icon = "✓"
+    elif data == "new_case":
+        icon = "＋"
+    else:
+        return reply.label
+    label = f"{icon} {reply.label}"
+    return label if len(label) <= 20 else reply.label
+
+
+def _postback_action(reply) -> dict:
+    return {"type": "postback", "label": _button_label(reply),
+            "data": reply.data, "displayText": reply.label}
+
+
+def build_flex_message(output: TurnOutput) -> dict | None:
+    """Render a short decision as a LINE card; long advice keeps its full text.
+
+    Location remains a native Quick Reply: LINE does not allow location actions
+    in Flex buttons. The card never reconstructs case data from a second source.
+    """
+    replies = output.quick_replies
+    if not output.output_text or not replies or len(replies) > 4 or len(output.output_text) > 1800:
+        return None
+    actions = [q for q in replies if q.type == "postback"]
+    data = [q.data or "" for q in replies]
+    if "consent=yes" in data:
+        title, caption = "ก่อนเริ่มคุยกัน", "คุณเลือกได้ว่าจะให้ใช้ข้อมูลหรือไม่"
+    elif any(d.startswith("confirm=") for d in data):
+        title, caption = "ตรวจสอบข้อมูลก่อนส่งต่อ", "ตรวจให้ถูกต้อง แล้วกดยืนยันด้านล่าง"
+    elif output.pending_question == "affected_people_confirmation":
+        title, caption = "ยืนยันจำนวนคน", "ช่วยตรวจจำนวนและกลุ่มผู้ประสบภัย"
+    elif output.pending_question == "reuse_contact":
+        title, caption = "ใช้ข้อมูลผู้แจ้งเดิมไหม?", "เลือกใช้ข้อมูลเดิม หรือแจ้งข้อมูลใหม่"
+    elif any(q.type == "location" for q in replies):
+        title, caption = "แชร์จุดที่ต้องการความช่วยเหลือ", "กดปุ่มแชร์ตำแหน่งใต้ข้อความนี้"
+    elif output.intake_status and output.intake_status.value == "confirmed":
+        title, caption = "บันทึกข้อมูลแล้ว", "แจ้งเพิ่มเติมในแชตนี้ได้เสมอ"
+    else:
+        title, caption = "ค่อย ๆ ไปทีละขั้น", "เลือกตัวเลือกด้านล่าง หรือพิมพ์ตอบได้เลย"
+    contents = {
+        "type": "bubble", "size": "mega",
+        "header": {"type": "box", "layout": "vertical", "backgroundColor": "#EDF7F2",
+                   "paddingAll": "20px", "spacing": "sm", "contents": [
+                       {"type": "text", "text": "FLOOD CARE", "size": "xs", "weight": "bold", "color": "#137C50"},
+                       {"type": "text", "text": title, "size": "lg", "weight": "bold", "wrap": True, "color": "#19352B"},
+                       {"type": "text", "text": caption, "size": "xs", "wrap": True, "color": "#597466"}]},
+        "body": {"type": "box", "layout": "vertical", "paddingAll": "20px", "contents": [
+            {"type": "text", "text": output.output_text, "size": "sm", "wrap": True, "color": "#294537"}]},
+    }
+    if actions:
+        buttons = []
+        for q in actions:
+            primary = (q.data == "consent=yes" or (q.data or "").startswith(
+                ("confirm=", "people_confirm=yes:", "reuse_contact=yes:", "intake=")))
+            button = {"type": "button", "height": "sm", "style": "primary" if primary else "secondary",
+                      "action": _postback_action(q)}
+            if primary:
+                button["color"] = "#137C50"
+            buttons.append(button)
+        contents["footer"] = {"type": "box", "layout": "vertical", "spacing": "sm",
+                              "paddingAll": "16px", "contents": buttons}
+    message = {"type": "flex", "altText": f"Flood Care · {title}\n{output.output_text}"[:400], "contents": contents}
+    return message if len(json.dumps(contents, ensure_ascii=False).encode()) < 28000 else None
+
+
+def build_messages(output: TurnOutput, *, style: Literal["flex", "text"] = "flex") -> list[dict]:
+    """Render LINE messages with revision-bound actions unchanged."""
+    card = build_flex_message(output) if style == "flex" else None
+    messages = [card] if card else [{"type": "text", "text": t} for t in _split_text(output.output_text)]
     if output.quick_replies and messages:
         items = []
         for q in output.quick_replies[:MAX_QUICK_REPLIES]:
             if q.type == "location":
-                action = {"type": "location", "label": q.label}
+                action = {"type": "location", "label": _button_label(q)}
             else:
-                action = {"type": "postback", "label": q.label, "data": q.data, "displayText": q.label}
+                action = _postback_action(q)
             items.append({"type": "action", "action": action})
         messages[-1]["quickReply"] = {"items": items}
     return messages

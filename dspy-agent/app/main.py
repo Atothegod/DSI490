@@ -28,7 +28,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, model_validator
 
 from .agent import Agent1
-from .knowledge import KnowledgeBase
+from .knowledge import DEFAULT_THRESHOLD, KnowledgeBase
 from .response import ResponseGenerator
 from .schemas import TurnOutput
 from .store import Store
@@ -80,7 +80,8 @@ def configure_dspy() -> str:
     if not api_key:
         raise RuntimeError("Missing Gemini API key. Set GEMINI_API_KEY or GOOGLE_API_KEY.")
     model = os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
-    dspy.configure(lm=dspy.LM(model=model, api_key=api_key))
+    dspy.configure(lm=dspy.LM(model=model, api_key=api_key,
+                             timeout=float(os.getenv("GEMINI_TIMEOUT_SECONDS", "20")), num_retries=0))
     return model
 
 
@@ -88,7 +89,8 @@ def push_line(line_user_id: str, output: TurnOutput) -> None:
     from .line_adapter import build_messages
     token = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
     httpx.post(f"{LINE_API}/push", headers={"Authorization": "Bearer " + token},
-               json={"to": line_user_id, "messages": build_messages(output)}, timeout=10).raise_for_status()
+               json={"to": line_user_id, "messages": build_messages(output, style=os.getenv("LINE_MESSAGE_STYLE", "flex"))},
+               timeout=10).raise_for_status()
 
 
 def send_reminders(agent: Agent1, store: Store) -> None:
@@ -100,16 +102,21 @@ def send_reminders(agent: Agent1, store: Store) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if os.getenv("APP_ENV") == "production":
+        missing = [name for name in ("LINE_CHANNEL_SECRET", "LINE_USER_HMAC_SECRET", "LINE_CHANNEL_ACCESS_TOKEN")
+                   if not os.getenv(name)]
+        if missing:
+            raise RuntimeError("Missing production LINE settings: " + ", ".join(missing))
     app.state.model = configure_dspy()
     database_url = os.getenv("DATABASE_URL", "sqlite:///agent1.sqlite3")
     app.state.store = Store(database_url)
     app.state.local_inspector_token = (
         secrets.token_urlsafe(32)
-        if os.getenv("LOCAL_CHAT_INSPECTOR") == "1" and database_url == "sqlite:///:memory:"
+        if os.getenv("APP_ENV") != "production" and os.getenv("LOCAL_CHAT_INSPECTOR") == "1" and database_url == "sqlite:///:memory:"
         else None
     )
     knowledge = KnowledgeBase(os.getenv("KNOWLEDGE_PATH", str(APP_DIR / "knowledge_th.csv")),
-                              threshold=float(os.getenv("RAG_THRESHOLD", "0.12")),
+                              threshold=float(os.getenv("RAG_THRESHOLD", str(DEFAULT_THRESHOLD))),
                               allow_unreviewed=os.getenv("KB_ALLOW_UNREVIEWED") == "1")
     if not knowledge.docs:
         log.warning("Knowledge Base ว่าง: ยังไม่มีเอกสารที่ผ่านผู้ตรวจ (ตั้ง KB_ALLOW_UNREVIEWED=1 เฉพาะตอนพัฒนา)")
@@ -144,7 +151,12 @@ def health() -> dict[str, str]:
     return {"status": "ok", "model": app.state.model}
 
 
-@app.post("/chat", response_model=TurnOutput)
+def require_test_access(authorization: str | None = Header(default=None)):
+    if os.getenv("APP_ENV") == "production":
+        require_admin(authorization)
+
+
+@app.post("/chat", response_model=TurnOutput, dependencies=[Depends(require_test_access)])
 def chat(payload: ChatRequest) -> TurnOutput:
     with app.state.lock:
         try:
@@ -158,6 +170,8 @@ def chat(payload: ChatRequest) -> TurnOutput:
 @app.get("/dev/chat", include_in_schema=False)
 def dev_chat(request: Request) -> FileResponse:
     """หน้าแชตจำลอง LINE สำหรับทดสอบ เรียก POST /chat เหมือนกัน"""
+    if os.getenv("APP_ENV") == "production":
+        raise HTTPException(status_code=404, detail="Not found")
     response = FileResponse(APP_DIR / "static" / "chat.html")
     response.headers["Cache-Control"] = "no-store"
     token = getattr(app.state, "local_inspector_token", None)
@@ -167,6 +181,8 @@ def dev_chat(request: Request) -> FileResponse:
 
 
 def require_local_inspector(request: Request):
+    if os.getenv("APP_ENV") == "production":
+        raise HTTPException(status_code=404, detail="Not found")
     token = getattr(app.state, "local_inspector_token", None)
     if not token:
         raise HTTPException(status_code=404, detail="Local inspector is disabled")
@@ -174,6 +190,13 @@ def require_local_inspector(request: Request):
     if (not request.client or request.client.host not in {"127.0.0.1", "::1"}
             or not hmac.compare_digest(supplied, token)):
         raise HTTPException(status_code=403, detail="Forbidden")
+
+
+def inspection_priority(payload: str) -> dict | None:
+    priority = json.loads(payload).get("priority")
+    if priority and priority.get("rule_id") == "P1":
+        return {**{k: v for k, v in priority.items() if k != "level"}, "status": "pending_assessment"}
+    return priority
 
 
 @app.get("/dev/inspector", dependencies=[Depends(require_local_inspector)], include_in_schema=False)
@@ -184,10 +207,20 @@ def local_inspector(user_id: str, response: Response):
         store = app.state.store
         with store.transaction() as cursor:
             rows = store._exec(cursor,
-                "SELECT d.case_id, d.draft_rev, c.intake_status, d.payload FROM case_drafts d "
-                "JOIN cases c ON c.case_id=d.case_id WHERE c.user_ref=? ORDER BY c.seq", (user_id,)).fetchall()
+                "SELECT d.case_id, d.draft_rev, c.intake_status, d.payload, s.payload FROM case_drafts d "
+                "JOIN cases c ON c.case_id=d.case_id JOIN case_slots s ON s.case_id=c.case_id "
+                "WHERE c.user_ref=? ORDER BY c.seq", (user_id,)).fetchall()
             drafts = [{"case_id": row[0], "draft_rev": row[1], "intake_status": row[2],
-                       "incident": json.loads(row[3])["incident"]} for row in rows]
+                       "incident": json.loads(row[3])["incident"],
+                       "problem_display": json.loads(row[3]).get("problem_display"),
+                       "priority": inspection_priority(row[3]),
+                       "risk_facts": json.loads(row[3]).get("priority_facts"),
+                       "risk_fact_evidence": json.loads(row[3]).get("risk_fact_evidence", {}),
+                       "context_subject": json.loads(row[4]).get("context_subject"),
+                       "context_complete": json.loads(row[4]).get("context_complete", False),
+                       "help_status": json.loads(row[4]).get("help_status", "missing"),
+                       "consultation_active": json.loads(row[4]).get("consultation_active", False),
+                       "pending_people_confirmation": json.loads(row[4]).get("pending_people_confirmation")} for row in rows]
             contacts = store._exec(cursor,
                 "SELECT p.case_id,p.first_name,p.last_name,p.phone_number FROM case_personal_data p "
                 "JOIN cases c ON c.case_id=p.case_id WHERE c.user_ref=? ORDER BY c.seq", (user_id,)).fetchall()
@@ -223,7 +256,8 @@ def dev_database(user_id: str):
                 "case_raw_messages": ("SELECT * FROM case_raw_messages WHERE user_ref=? ORDER BY created_at", (user_id,)),
             }
             for name in ("case_personal_data", "case_drafts", "case_slots", "case_versions",
-                         "case_version_contacts", "case_events", "pipeline_confirmed_cases", "pipeline_confirmed_cases_v2", "pipeline_case_contacts"):
+                         "case_version_contacts", "case_events", "pipeline_confirmed_cases", "pipeline_confirmed_cases_v2",
+                         "pipeline_confirmed_cases_v3", "pipeline_confirmed_cases_v4", "pipeline_case_contacts"):
                 queries[name] = (f"SELECT * FROM {name} WHERE case_id IN (SELECT case_id FROM cases WHERE user_ref=?)", (user_id,))
             for name, (sql, args) in queries.items():
                 cursor = store._exec(c, sql, args)
@@ -259,7 +293,7 @@ async def line_webhook(request: Request, x_line_signature: str | None = Header(d
     def handle():
         store, agent = app.state.store, app.state.agent
         for event in events:
-            if not event.event_id or event.kind in {"follow", "unfollow"} or not event.reply_token:
+            if not event.event_id or event.kind == "unfollow" or not event.reply_token:
                 continue
             with app.state.lock:
                 cached = store.receipt(event.event_id)
@@ -271,11 +305,17 @@ async def line_webhook(request: Request, x_line_signature: str | None = Header(d
                 elif event.kind == "unsupported":
                     output = TurnOutput(output_text=agent.t["unsupported_message"])
                 else:
-                    output = agent.handle(event.user_id, **event.agent_kwargs())
+                    try:
+                        output = agent.handle(event.user_id, **event.agent_kwargs())
+                    except Exception as exc:
+                        log.error("LINE processing failed: %s", type(exc).__name__)
+                        output = TurnOutput(output_text="เมื่อสักครู่ระบบตอบไม่สำเร็จค่ะ กรุณาลองส่งข้อความอีกครั้งนะคะ")
+                        # A fresh user message can retry; never log message content.
                 store.record_receipt(event.event_id, {"output": output.model_dump(mode="json"), "delivered": False})
             try:
                 httpx.post(f"{LINE_API}/reply", headers={"Authorization": "Bearer " + token},
-                           json={"replyToken": event.reply_token, "messages": build_messages(output)},
+                           json={"replyToken": event.reply_token, "messages": build_messages(
+                               output, style=os.getenv("LINE_MESSAGE_STYLE", "flex"))},
                            timeout=10).raise_for_status()
             except httpx.HTTPError:
                 raise HTTPException(status_code=502, detail="LINE reply failed")
