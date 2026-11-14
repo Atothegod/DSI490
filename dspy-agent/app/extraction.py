@@ -29,7 +29,7 @@ answers เก็บคู่คำถามกับคำตอบแล้ว
 intents (เลือกได้หลายค่า): incident = แจ้งเหตุหรือให้ข้อมูลเหตุ, question = ถามคำถามหรือขอคำแนะนำ,
 emotional = แสดงความรู้สึก เช่น กลัว เครียด เสียใจ, police = แจ้งเหตุร้ายที่ต้องใช้ตำรวจ
 
-case_intent: same_case = ข้อมูลของเคสที่กำลังคุย, new_case = แจ้งเหตุอีกบ้านหรือแจ้งแทนคนอื่นที่อยู่คนละที่,
+case_intent: same_case = ข้อมูลต่อเนื่องหรือแก้ไขเคสที่กำลังคุย รวมคำตอบจำนวนคน/ข้อความสั้น ห้ามเปิดเคสใหม่จากการตอบ slot, new_case = แจ้งเหตุอีกบ้านหรือเหตุครั้งใหม่ที่ชัดเจน,
 relocate = ผู้ประสบภัยย้ายไปอยู่จุดอื่น, unclear = ไม่แน่ใจว่าหมายถึงเคสไหน
 
 problem: รวมสถานการณ์ อาการ รายละเอียด และความช่วยเหลือที่ต้องการไว้ในข้อความเดียว ไม่แยก needs
@@ -209,6 +209,25 @@ def proposed_people(text: str) -> dict[str, int] | None:
             group = "children" if months < 216 else "other"
         counts[group] = counts.get(group, 0) + 1
     return counts
+
+
+def reported_total(text: str) -> int | None:
+    """An explicit total replaces the breakdown; ages and companions aren't totals."""
+    if re.search(r"มีคนอยู่ด้วย\s*\d+", text):
+        return None
+    if re.search(r"อยู่(?:บ้าน)?คนเดียว", text):
+        return 1
+    matches = list(re.finditer(r"(?:มี|รวม|ทั้งหมด|เหลือ)\s*(?:คน(?:ติดอยู่|ติดค้าง|อยู่)?\s*)?(\d+)\s*คน", text))
+    return int(matches[0][1]) if len(matches) == 1 and int(matches[0][1]) > 0 else None
+
+
+def incident_clauses(text: str) -> list[str]:
+    """Only split explicit distinct household subjects, never invent a second case."""
+    matches = list(re.finditer(r"บ้าน(?:ผม|ฉัน|เรา|แม่|พ่อ|พี่|น้อง)", text))
+    if len({m[0] for m in matches}) < 2:
+        return []
+    return [text[m.start():matches[i+1].start() if i+1 < len(matches) else len(text)].strip()
+            for i,m in enumerate(matches)]
 
 
 def is_people_addition(text: str) -> bool:

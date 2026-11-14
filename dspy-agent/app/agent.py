@@ -34,7 +34,7 @@ from .case import (
     version_snapshot,
 )
 from .extraction import (Extractor, ground, is_medical_or_distress, proposed_people, replaced_person,
-                         explicit_count_list, is_people_addition)
+                         explicit_count_list, is_people_addition, reported_total, incident_clauses)
 from .knowledge import KBDoc, KnowledgeBase
 from .priority import evaluate_priority, merge_facts
 from .privacy import FilterResult, filter_text, normalize_text
@@ -165,7 +165,20 @@ class Agent1:
         f = filter_text(text)
         if message_id is None:
             message_id = self.store.add_raw(user["user_ref"], case.case_id if case else None, "in", "text", text)
+        if user.get("pending_question") == "case_intent_confirmation":
+            answer = re.sub(r"\s+", "", f.text)
+            choice = "yes" if re.fullmatch(r"(?:ใช่|เหตุใหม่)(?:ครับ|ค่ะ|คะ)?", answer) else "no" if re.fullmatch(r"(?:ไม่ใช่|เคสเดิม)(?:ครับ|ค่ะ|คะ)?", answer) else None
+            if choice and case:
+                return self._postback(user, f"case_intent={choice}:{case.case_id}:{case.draft_rev}:{user['held_message_id']}")
         user["pending_question"] = None
+        clauses = incident_clauses(f.text)
+        if clauses:
+            user["pending_question"] = "multiple_incidents"
+            user["held_message_id"] = message_id
+            reply.add("มีเหตุอยู่มากกว่าหนึ่งบ้านค่ะ ขอแยกข้อมูลทีละบ้านเพื่อไม่ให้จำนวนคนและพิกัดปนกัน ต้องการเริ่มจากบ้านไหนคะ?")
+            reply.quick_replies = [QuickReply(label=clause.split('ที่')[0][:16], data=f"incident_focus={i}:{message_id}")
+                                   for i,clause in enumerate(clauses[:4])]
+            return self._finish(user, None, reply)
 
         if case and case.pending_question == "reuse_contact":
             answer = re.sub(r"\s+", "", f.text)
@@ -242,8 +255,13 @@ class Agent1:
         if case is None and len(actives) == 1:
             case = actives[0]
         if ex.case_intent == CaseIntent.NEW_CASE and case is not None and not selected and (case.incident.problem or case.current_version):
-            case = self._open_case(user)
-            ex = ground(self.extract(f.text, case.incident, None, ""), f.text)
+            user["pending_question"] = "case_intent_confirmation"
+            user["held_message_id"] = message_id
+            ref = f"{case.case_id}:{case.draft_rev}:{message_id}"
+            reply.add("ข้อความนี้เป็นเหตุใหม่ แยกจากเคสที่กำลังคุยอยู่ใช่ไหมคะ? ถ้าเป็นข้อมูลเพิ่มเติม เลือกเคสเดิมได้เลยค่ะ")
+            reply.quick_replies = [QuickReply(label="เหตุใหม่", data=f"case_intent=yes:{ref}"),
+                                   QuickReply(label="เพิ่มเติมเคสเดิม", data=f"case_intent=no:{ref}")]
+            return self._finish(user, None, reply)
         elif case is None and has_incident:
             case = self._open_case(user)
         if case is None:
@@ -426,7 +444,14 @@ class Agent1:
         elif ex.affected_people.has_anyone():
             case.pending_people_confirmation = None
             case.pending_people_label = None
+        total = reported_total(f.text)
+        if total is not None:
+            case.incident.affected_people = AffectedPeople(other=total)
+            case.pending_people_confirmation = None
+            case.pending_people_label = None
         for group in AFFECTED_GROUPS:
+            if total is not None:
+                break
             if (value := getattr(ex.affected_people, group)) is not None:
                 previous = getattr(case.incident.affected_people, group) or 0
                 setattr(case.incident.affected_people, group, previous + value if is_people_addition(f.text) else value)
@@ -649,7 +674,11 @@ class Agent1:
         if case.incident.problem and case.help_status == "missing":
             case.pending_question = "requested_help"
             case.intake_status = IntakeStatus.COLLECTING
-            reply.add(self.t["ask_requested_help"])
+            case.help_ask_count += 1
+            reply.add(self.t["ask_requested_help"] if case.help_ask_count <= 2 else "ยังไม่ทราบความช่วยเหลือที่ต้องการค่ะ เลือกด้านล่างหรือพิมพ์บอกได้เมื่อพร้อมนะคะ")
+            ref = f"{case.case_id}:{case.draft_rev}"
+            reply.quick_replies = [QuickReply(label=label, data=f"request_help={key}:{ref}") for key,label in (
+                ("food", "อาหารและน้ำดื่ม"), ("boat", "เรือช่วยอพยพ"), ("consult", "ปรึกษาเบื้องต้น"), ("unsure", "ยังไม่แน่ใจ"))]
             return
         # Complete the meaning of problem before asking contact/location slots,
         # with a cap and never the same question twice. When out of questions,
@@ -816,6 +845,36 @@ class Agent1:
         reply = Reply()
         key, _, value = data.partition("=")
         case = self._current_case(user)
+        if key == "request_help":
+            parts=value.split(":")
+            texts={"food":"ต้องการอาหารและน้ำดื่ม", "boat":"ต้องการเรือช่วยอพยพ", "consult":"อยากปรึกษา", "unsure":"ยังไม่แน่ใจว่าต้องการอะไร"}
+            if len(parts)!=3 or not case or parts[0] not in texts or parts[1]!=case.case_id or parts[2]!=str(case.draft_rev):
+                reply.add(self.t["stale_button"])
+                return self._finish(user,case,reply)
+            return self._text(user,texts[parts[0]],selected=True)
+        if key == "case_intent":
+            parts=value.split(":")
+            if (len(parts)!=4 or not case or parts[0] not in {"yes","no"} or parts[1]!=case.case_id
+                    or parts[2]!=str(case.draft_rev) or user.get("pending_question")!="case_intent_confirmation"
+                    or user.get("held_message_id")!=parts[3]):
+                reply.add(self.t["stale_button"])
+                return self._finish(user,case,reply)
+            held=self.store.raw(parts[3]) or ""
+            user["pending_question"]=user["held_message_id"]=None
+            if parts[0]=="yes":
+                self._open_case(user)
+            return self._text(user,held,message_id=parts[3],selected=True)
+        if key == "incident_focus":
+            parts=value.split(":")
+            if len(parts)!=2 or user.get("pending_question")!="multiple_incidents" or user.get("held_message_id")!=parts[1] or not parts[0].isdigit():
+                reply.add(self.t["stale_button"])
+                return self._finish(user,case,reply)
+            clauses=incident_clauses(self.store.raw(parts[1]) or "")
+            if int(parts[0])>=len(clauses):
+                reply.add(self.t["stale_button"])
+                return self._finish(user,case,reply)
+            user["pending_question"]=user["held_message_id"]=None
+            return self._text(user,clauses[int(parts[0])])
         if key == "intake":
             if case is None or case.case_id != value:
                 reply.add(self.t["stale_button"])

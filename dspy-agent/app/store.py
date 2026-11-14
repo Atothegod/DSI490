@@ -204,7 +204,7 @@ class Store:
             "incident", "problem_display", "editing", "draft_round", "reminder_sent",
             "last_user_at", "address_masked", "priority", "priority_facts", "risk_fact_evidence", "emergency_notified"})
         slots = case.model_dump(mode="json", include={
-            "slots", "missing_notice_sent", "expect_relocation", "reuse_contact_asked", "reuse_contact_source", "reuse_contact_source_rev", "last_intents", "conversation_summary", "conversation_context", "context_complete", "context_question", "context_paused", "pending_people_confirmation", "pending_people_label", "context_subject", "consultation_active", "help_status", "help_evidence"})
+            "slots", "missing_notice_sent", "expect_relocation", "reuse_contact_asked", "reuse_contact_source", "reuse_contact_source_rev", "last_intents", "conversation_summary", "conversation_context", "context_complete", "context_question", "context_paused", "pending_people_confirmation", "pending_people_label", "context_subject", "consultation_active", "help_status", "help_evidence", "help_ask_count"})
         upsert = "INSERT INTO {t} VALUES ({q}) ON CONFLICT(case_id) DO UPDATE SET {s}"
         self._exec(c, upsert.format(t="case_personal_data", q="?,?,?,?,?,?,?,?", s=", ".join(
             f"{k}=excluded.{k}" for k in ("first_name", "last_name", "phone_number", "latitude", "longitude",

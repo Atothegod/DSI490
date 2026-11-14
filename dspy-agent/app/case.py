@@ -88,6 +88,7 @@ class Case(StrictModel):
     consultation_active: bool = False
     help_status: Literal["missing", "known", "unsure", "none"] = "missing"
     help_evidence: str | None = None
+    help_ask_count: int = Field(default=0, ge=0)
     conversation_summary: str = ""
     conversation_context: ConversationContext = Field(default_factory=ConversationContext)
 
