@@ -215,6 +215,9 @@ def reported_total(text: str) -> int | None:
     """An explicit total replaces the breakdown; ages and companions aren't totals."""
     if re.search(r"มีคนอยู่ด้วย\s*\d+", text):
         return None
+    standalone = re.fullmatch(r"\s*(\d+)\s*คน\s*(?:ครับ|ค่ะ|คะ)?", text)
+    if standalone and int(standalone[1]) > 0:
+        return int(standalone[1])
     if re.search(r"อยู่(?:บ้าน)?คนเดียว", text):
         return 1
     matches = list(re.finditer(r"(?:มี|รวม|ทั้งหมด|เหลือ)\s*(?:คน(?:ติดอยู่|ติดค้าง|อยู่)?\s*)?(\d+)\s*คน", text))

@@ -175,7 +175,7 @@ class Agent1:
         if clauses:
             user["pending_question"] = "multiple_incidents"
             user["held_message_id"] = message_id
-            reply.add("มีเหตุอยู่มากกว่าหนึ่งบ้านค่ะ ขอแยกข้อมูลทีละบ้านเพื่อไม่ให้จำนวนคนและพิกัดปนกัน ต้องการเริ่มจากบ้านไหนคะ?")
+            reply.add("มีเหตุอยู่มากกว่าหนึ่งบ้านค่ะ ขอแยกเป็นคนละเคสเพื่อไม่ให้จำนวนคนและพิกัดปนกัน ต้องการเริ่มเปิดเคสบ้านไหนก่อนคะ?")
             reply.quick_replies = [QuickReply(label=clause.split('ที่')[0][:16], data=f"incident_focus={i}:{message_id}")
                                    for i,clause in enumerate(clauses[:4])]
             return self._finish(user, None, reply)
@@ -188,6 +188,11 @@ class Agent1:
             if re.fullmatch(r"(?:ไม่ใช่|ไม่ใช้|ไม่|ข้อมูลใหม่)(?:ครับ|ค่ะ|คะ)?", answer):
                 self._reuse_contact(case, False, reply)
                 return self._finish(user, case, reply)
+
+        if case and re.search(r"มีคนอยู่ด้วย\s*\d+", f.text):
+            case.pending_question = SlotName.AFFECTED_PEOPLE.value
+            reply.add("จำนวนคนที่บอกมารวมตัวคุณแล้วหรือยังคะ? ช่วยบอกจำนวนรวมทั้งหมดอีกครั้ง เช่น รวมทั้งหมด 5 คนค่ะ")
+            return self._finish(user, case, reply)
 
         if case and case.pending_question == SlotName.PHONE_NUMBER.value:
             attempt = normalize_text(text).strip()
@@ -245,6 +250,8 @@ class Agent1:
                                      self._conversation_context(case) if case else ""), f.text,
                         risk_question=case.context_question if case and (case.pending_question == "problem" or (case.pending_question or "").startswith("assessment:")) else None)
 
+        if reported_total(f.text) is not None and not re.search(r"คลอง|จังหวัด|บ้านแม่|บ้านพ่อ|เหตุใหม่|อีกบ้าน", f.text):
+            ex.case_intent = CaseIntent.SAME_CASE
         # Multi-Case: เจตนาและการยืนยันเป็นตัวแยกเคส ไม่ใช้ระยะทาง
         actives = self.store.active_cases(user["user_ref"])
         has_incident = bool(ex.intents or ex.problem or ex.affected_people.has_anyone())
@@ -254,7 +261,7 @@ class Agent1:
             return self._ask_case_selection(user, actives, message_id, reply)
         if case is None and len(actives) == 1:
             case = actives[0]
-        if ex.case_intent == CaseIntent.NEW_CASE and case is not None and not selected and (case.incident.problem or case.current_version):
+        if ex.case_intent == CaseIntent.NEW_CASE and ex.problem and case is not None and not selected and (case.incident.problem or case.current_version):
             user["pending_question"] = "case_intent_confirmation"
             user["held_message_id"] = message_id
             ref = f"{case.case_id}:{case.draft_rev}:{message_id}"
@@ -874,7 +881,8 @@ class Agent1:
                 reply.add(self.t["stale_button"])
                 return self._finish(user,case,reply)
             user["pending_question"]=user["held_message_id"]=None
-            return self._text(user,clauses[int(parts[0])])
+            self._open_case(user)
+            return self._text(user,clauses[int(parts[0])],selected=True)
         if key == "intake":
             if case is None or case.case_id != value:
                 reply.add(self.t["stale_button"])

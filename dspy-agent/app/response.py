@@ -135,7 +135,7 @@ def template_reply(empathy_text: str | None, docs: list[KBDoc]) -> Composed:
             parts.append(doc.text + "ค่ะ")
             ids.append(doc.kb_doc_id)
         else:
-            parts.append("ยังสรุปคำแนะนำเรื่องนี้ให้สั้นและครบเงื่อนไขอย่างมั่นใจไม่ได้ค่ะ")
+            parts.append("เรื่องนี้ยังให้คำแนะนำอย่างมั่นใจไม่ได้ค่ะ")
     return Composed(" ".join(parts), ids, True)
 
 
